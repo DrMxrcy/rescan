@@ -4,7 +4,8 @@ services:
     container_name: rescan
     # To build locally instead, use: build: .
     image: ghcr.io/drmxrcy/rescan:latest
-    hostname: rescan 
+    user: "1000:1000"
+    hostname: rescan
     networks: 
       - saltbox
     labels:
