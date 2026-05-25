@@ -21,7 +21,7 @@ import aiohttp
 _parser = _argparse.ArgumentParser(
     description="Rescan media library scanner", add_help=False
 )
-_parser.add_argument("--config", default="config.ini", help="Path to config.ini")
+_parser.add_argument("--config", default="config/config.ini", help="Path to config.ini")
 _args, _ = _parser.parse_known_args()
 
 config = configparser.ConfigParser()
