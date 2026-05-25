@@ -1,8 +1,9 @@
 services:
   rescan:
     restart: unless-stopped 
-    container_name: rescan 
-    build: .
+    container_name: rescan
+    # To build locally instead, use: build: .
+    image: ghcr.io/pukabyte/rescan:latest
     hostname: rescan 
     networks: 
       - saltbox
