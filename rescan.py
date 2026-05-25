@@ -9,7 +9,6 @@ import time
 from collections import defaultdict
 from plexapi.server import PlexServer
 import logging
-import json
 from datetime import datetime
 import schedule
 import discord
@@ -1196,7 +1195,6 @@ def run_scan():
                     
                     # Trigger scans on servers where file was not found
                     parent_folder = os.path.dirname(file_path)
-                    servers_scanned = False
                     for server_status in missing_servers:
                         if server_status['library_info']:
                             server_key = f"{server_status['server_type']}:{server_status['server_url']}"
@@ -1219,7 +1217,6 @@ def run_scan():
                                         server_status['server_type']
                                     )
                                     scanned_folders.add(folder_key)
-                                    servers_scanned = True
                                 else:
                                     warning_msg = f"[WARN] Could not determine library for {filename} on {server_status['server_type']}"
                                     logger.warning(warning_msg)
