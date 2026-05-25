@@ -61,6 +61,8 @@ library_paths = {}
 directory_cache = {}
 # Per-server library cache to avoid redundant API calls
 _library_cache = {}
+# Bulk path cache for Jellyfin/Emby (built once per scan cycle)
+_server_path_caches: dict = {}  # {server_url: set of normalized file paths}
 
 # ANSI escape codes for text formatting
 BOLD = '\033[1m'
@@ -507,6 +509,36 @@ def get_libraries_emby(server_info):
         logger.error(f"[FAIL] Emby | Could not fetch libraries: {str(e)}")
     return libraries
 
+def _build_server_path_cache(server_info, server_label):
+    """Fetch ALL media item paths from a Jellyfin/Emby server in one API call.
+
+    Returns a set of normalised absolute paths.
+    Called once per scan cycle; result stored in _server_path_caches.
+    """
+    url = f"{server_info['url']}/Items"
+    headers = {'X-Emby-Token': server_info['token']}
+    params = {
+        'Recursive': 'true',
+        'IncludeItemTypes': 'Movie,Episode',
+        'Fields': 'Path,MediaSources',
+        'Limit': 999999,
+    }
+    paths: set = set()
+    try:
+        response = _request_with_retry(requests.get, url, headers=headers, params=params, timeout=60)
+        response.raise_for_status()
+        items = response.json().get('Items', [])
+        for item in items:
+            if 'Path' in item:
+                paths.add(os.path.normpath(item['Path']))
+            for ms in item.get('MediaSources', []):
+                if 'Path' in ms:
+                    paths.add(os.path.normpath(ms['Path']))
+        logger.info(f"[CACHE] {server_label} | Cached {len(paths):,} paths from {server_info['url']}")
+    except Exception as e:
+        logger.error(f"[FAIL] {server_label} | Could not build path cache: {e}")
+    return paths
+
 def get_library_ids():
     """Fetch library section IDs and paths dynamically from all media servers."""
     global library_ids, library_paths, _library_cache
@@ -799,12 +831,18 @@ def _check_file_emby_api(file_path, library_info, server_info, server_label):
         return False
 
 def check_file_jellyfin(file_path, library_info, server_info):
-    """Check if a file exists in a Jellyfin server."""
-    return _check_file_emby_api(file_path, library_info, server_info, 'Jellyfin')
+    """Check if a file exists in a Jellyfin server using the bulk path cache."""
+    server_url = server_info['url']
+    if server_url not in _server_path_caches:
+        _server_path_caches[server_url] = _build_server_path_cache(server_info, 'Jellyfin')
+    return os.path.normpath(file_path) in _server_path_caches[server_url]
 
 def check_file_emby(file_path, library_info, server_info):
-    """Check if a file exists in an Emby server."""
-    return _check_file_emby_api(file_path, library_info, server_info, 'Emby')
+    """Check if a file exists in an Emby server using the bulk path cache."""
+    server_url = server_info['url']
+    if server_url not in _server_path_caches:
+        _server_path_caches[server_url] = _build_server_path_cache(server_info, 'Emby')
+    return os.path.normpath(file_path) in _server_path_caches[server_url]
 
 def check_file_in_all_servers(file_path):
     """Check if a file exists in all media servers and return status for each server.
@@ -1072,6 +1110,7 @@ def run_scan():
     
     # Clear directory cache at the start of a new scan
     directory_cache.clear()
+    _server_path_caches.clear()
     logger.info("--- SCAN CYCLE START ---")
     
     library_ids = get_library_ids()
