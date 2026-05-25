@@ -262,7 +262,8 @@ class RunStats:
 
         try:
             # Create webhook client with aiohttp session
-            async with aiohttp.ClientSession() as session:
+            _timeout = aiohttp.ClientTimeout(total=30)
+            async with aiohttp.ClientSession(timeout=_timeout) as session:
                 webhook = Webhook.from_url(DISCORD_WEBHOOK_URL, session=session)
 
                 # Create embed
@@ -1193,6 +1194,13 @@ def run_scan():
     # Send the final summary to Discord
     asyncio.run(stats.send_discord_summary())
 
+def _safe_run_scan():
+    """Wrapper for scheduled calls — prevents exceptions from crashing the scheduler loop."""
+    try:
+        run_scan()
+    except Exception as e:
+        logger.error(f"[FAIL] Scheduled scan failed: {e}", exc_info=True)
+
 def main():
     """Main function to run the scanner on a schedule."""
     server_labels = []
@@ -1212,11 +1220,14 @@ def main():
     logger.info("========================================")
     
     # Run immediately on startup
-    run_scan()
-    
-    # Schedule subsequent runs
-    schedule.every(RUN_INTERVAL).hours.do(run_scan)
-    
+    try:
+        run_scan()
+    except Exception as e:
+        logger.error(f"[FAIL] Initial scan failed: {e}", exc_info=True)
+
+    # Schedule subsequent runs (use _safe_run_scan so errors don't crash the loop)
+    schedule.every(RUN_INTERVAL).hours.do(_safe_run_scan)
+
     while True:
         schedule.run_pending()
         time.sleep(60)  # Check every minute for pending tasks
