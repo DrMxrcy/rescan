@@ -1240,10 +1240,13 @@ def scan_folder(library_id, folder_path, server_url, token, server_type):
 
 
 def is_broken_symlink(file_path):
-    """Check if a file is a broken symlink."""
+    """Check if a path is a broken symlink and return the target if broken."""
     if not os.path.islink(file_path):
-        return False
-    return not os.path.exists(os.path.realpath(file_path))
+        return False, None
+    target = os.readlink(file_path)
+    if not os.path.exists(file_path):
+        return True, target
+    return False, None
 
 
 def run_scan():
@@ -1298,6 +1301,19 @@ def run_scan():
             directories_in_path += 1
             media_files_in_dir = 0
 
+            # Check for broken directory symlinks
+            if SYMLINK_CHECK:
+                for d in dirs[:]:  # iterate over a copy since we may remove
+                    dir_path = os.path.join(root, d)
+                    broken, target = is_broken_symlink(dir_path)
+                    if broken:
+                        target_info = f" -> {target}" if target else ""
+                        logger.warning(
+                            f"[SKIP] Broken directory symlink: {d}{target_info}"
+                        )
+                        stats.increment_broken_symlinks()
+                        dirs.remove(d)
+
             for file in files:
                 if file.startswith("."):
                     continue  # skip hidden/system files
@@ -1311,12 +1327,15 @@ def run_scan():
                 file_path = os.path.join(root, file)
 
                 # Check for broken symlinks if enabled
-                if SYMLINK_CHECK and is_broken_symlink(file_path):
-                    logger.warning(
-                        f"[SKIP] Broken symlink: {os.path.basename(file_path)}"
-                    )
-                    stats.increment_broken_symlinks()
-                    continue
+                if SYMLINK_CHECK:
+                    broken, target = is_broken_symlink(file_path)
+                    if broken:
+                        target_info = f" -> {target}" if target else ""
+                        logger.warning(
+                            f"[SKIP] Broken symlink: {os.path.basename(file_path)}{target_info}"
+                        )
+                        stats.increment_broken_symlinks()
+                        continue
 
                 stats.increment_scanned()
 
