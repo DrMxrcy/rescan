@@ -1,3 +1,4 @@
+import argparse as _argparse
 import os
 import requests
 import configparser
@@ -17,7 +18,6 @@ import aiohttp
 
 # === CONFIG ===
 
-import argparse as _argparse
 _parser = _argparse.ArgumentParser(description='Rescan media library scanner', add_help=False)
 _parser.add_argument('--config', default='config.ini', help='Path to config.ini')
 _args, _ = _parser.parse_known_args()
