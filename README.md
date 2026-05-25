@@ -12,7 +12,6 @@
   <a href="https://github.com/DrMxrcy/rescan/issues"><img alt="Issues" src="https://img.shields.io/github/issues/DrMxrcy/rescan" /></a>
   <a href="https://github.com/DrMxrcy/rescan/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/DrMxrcy/rescan"></a>
   <a href="https://github.com/DrMxrcy/rescan/graphs/contributors"><img alt="Contributors" src="https://img.shields.io/github/contributors/DrMxrcy/rescan" /></a>
-  <a href="https://discord.gg/vMSnNcd7m5"><img alt="Discord" src="https://img.shields.io/badge/Join%20discord-8A2BE2" /></a>
   <br/>
   <a href="https://github.com/DrMxrcy/rescan/actions"><img alt="Docker Build" src="https://img.shields.io/github/actions/workflow/status/DrMxrcy/rescan/docker.yml?label=docker%20build" /></a>
   <a href="https://github.com/DrMxrcy/rescan/actions"><img alt="Lint" src="https://img.shields.io/github/actions/workflow/status/DrMxrcy/rescan/lint.yml?label=lint" /></a>
@@ -20,7 +19,10 @@
 
 <div align="center">
   <p>Keep your Plex, Jellyfin, and Emby libraries in sync with your media files.</p>
+  <p><em>Forked from <a href="https://github.com/Pukabyte/rescan">Pukabyte/rescan</a> with significant performance and reliability improvements.</em></p>
 </div>
+
+---
 
 # Rescan
 
@@ -29,6 +31,25 @@ This is a good once-over in case your autoscan tool misses an import or an upgra
 It can also provide Discord notification summaries with detailed statistics.<br/>
 
 <img alt="rescan" src="assets/discord.png" width="400">
+
+## What's New in This Fork
+
+This fork builds on the original Pukabyte/rescan with a focus on **multi-server support, performance, and production reliability**:
+
+| Feature | Status |
+|---------|--------|
+| **Jellyfin & Emby support** | New — not just Plex anymore |
+| **Jellyfin/Emby bulk path cache** | O(1) lookups instead of 10,000+ per-file API calls |
+| **Graceful shutdown** | `docker stop` exits cleanly via SIGTERM/SIGINT handling |
+| **Scheduling crash protection** | Wrapped in try/except with aiohttp 30s timeouts |
+| **Environment variable overrides** | `PLEX_TOKEN`, `JELLYFIN_TOKEN`, `DISCORD_WEBHOOK_URL` for Docker secrets |
+| **`--config` CLI flag** | Point to any config file path |
+| **Non-root Docker container** | Runs as UID 1000 for better security |
+| **Healthcheck** | Built-in Dockerfile `HEALTHCHECK` |
+| **Broken directory symlinks** | Detects and skips broken directory symlinks, not just files |
+| **Multi-arch GHCR builds** | `linux/amd64` and `linux/arm64` via GitHub Actions |
+| **Ruff linting CI** | Automated code quality checks on every push |
+| **Dependabot** | Weekly dependency updates for pip and GitHub Actions |
 
 ## Features
 
@@ -39,7 +60,7 @@ It can also provide Discord notification summaries with detailed statistics.<br/
 - **Docker support** — pre-built multi-arch images (amd64 + arm64) via GitHub Container Registry
 - **Graceful shutdown** — handles SIGTERM/SIGINT cleanly so `docker stop` exits immediately
 - **Flexible configuration** — config file, `--config` CLI flag, or environment variable overrides
-- **Broken symlink detection** — optionally check for and report broken symlinks
+- **Broken symlink detection** — optionally check for and report broken symlinks (files and directories)
 - **Scheduled scanning** — configurable intervals with crash protection and request timeouts
 - **Both movie and TV show libraries** — works across all library types
 
@@ -83,6 +104,7 @@ services:
     image: ghcr.io/drmxrcy/rescan:latest
     container_name: rescan
     restart: unless-stopped
+    user: "1000:1000"
     volumes:
       - /opt/rescan:/app/config
       - /mnt:/mnt
@@ -155,7 +177,7 @@ python rescan.py --config /path/to/custom/config.ini
 - `directories` — Comma-separated list of directories to scan
 - `scan_interval` — Seconds to wait between rescans
 - `run_interval` — Hours between full scans
-- `symlink_check` — Enable/disable broken symlink detection
+- `symlink_check` — Enable/disable broken symlink detection (files and directories)
 
 **Notification Settings**
 - `enabled` — Enable/disable Discord notifications
@@ -166,7 +188,7 @@ python rescan.py --config /path/to/custom/config.ini
 When enabled, Rescan sends detailed notifications to Discord including:
 - Overview of missing items across all servers
 - Library-specific statistics
-- Broken symlinks (if enabled)
+- Broken symlinks with target paths (if enabled)
 - Errors and warnings
 
 ## Manual Installation
@@ -203,7 +225,7 @@ python rescan.py
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the MIT License — see the LICENSE file for details.
 
 ## Acknowledgments
 
