@@ -41,6 +41,7 @@ This fork builds on the original Pukabyte/rescan with a focus on **multi-server 
 | **Jellyfin & Emby support** | New — not just Plex anymore |
 | **Jellyfin/Emby bulk path cache** | O(1) lookups instead of 10,000+ per-file API calls |
 | **Persistent repair cooldown cache** | Avoids repeatedly rescanning unchanged missing folders |
+| **Per-library workers** | Scans independent library roots concurrently while keeping server repair calls rate-limited |
 | **Graceful shutdown** | `docker stop` exits cleanly via SIGTERM/SIGINT handling |
 | **Scheduling crash protection** | Wrapped in try/except with aiohttp 30s timeouts |
 | **Environment variable overrides** | `PLEX_TOKEN`, `JELLYFIN_TOKEN`, `DISCORD_WEBHOOK_URL` for Docker secrets |
@@ -58,6 +59,8 @@ This fork builds on the original Pukabyte/rescan with a focus on **multi-server 
 - **Multiple servers per platform** — connect several Plex, Jellyfin, or Emby instances at once
 - **Fast Jellyfin/Emby scanning** — bulk path cache for O(1) lookups instead of per-file API calls
 - **Persistent repair cooldown cache** — SQLite state prevents repeated targeted scans for unchanged missing files
+- **Per-library workers** — scan separate library roots concurrently without concurrent repair posts
+- **Optional metadata repair** — refresh Jellyfin/Emby items with obviously missing metadata
 - **Discord notifications** — detailed summaries with library statistics, missing items, and broken symlinks
 - **Docker support** — pre-built multi-arch images (amd64 + arm64) via GitHub Container Registry
 - **Graceful shutdown** — handles SIGTERM/SIGINT cleanly so `docker stop` exits immediately
@@ -146,9 +149,11 @@ directories = /path/to/your/media/folder
 scan_interval = 5
 run_interval = 24
 symlink_check = true
+library_workers = 2
 state_cache = true
 state_db = rescan.db
 repair_scan_cooldown_hours = 24
+metadata_repair = false
 
 [notifications]
 enabled = false
@@ -183,9 +188,11 @@ python rescan.py --config /path/to/custom/config.ini
 - `scan_interval` — Seconds to wait between rescans
 - `run_interval` — Hours between full scans
 - `symlink_check` — Enable/disable broken symlink detection (files and directories)
+- `library_workers` — Number of library roots to scan concurrently; repair requests remain sequential
 - `state_cache` — Enable/disable the SQLite state cache
 - `state_db` — SQLite database path; relative paths are stored beside `config.ini`
 - `repair_scan_cooldown_hours` — Hours to suppress repeat repair scans for unchanged missing files
+- `metadata_repair` — Enable Jellyfin/Emby item metadata refreshes for indexed files with no provider IDs, production year, or premiere date
 
 The state cache is disposable. Deleting `rescan.db` only makes the next run rebuild
 state from the current scan.

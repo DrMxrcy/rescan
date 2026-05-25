@@ -4,11 +4,12 @@ import os
 import sys
 import requests
 import configparser
-import sqlite3
 import xml.etree.ElementTree as ET
 from urllib.parse import quote
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 from plexapi.server import PlexServer
 import logging
 from datetime import datetime
@@ -17,6 +18,7 @@ import discord
 from discord import Webhook, Embed, Color
 import asyncio
 import aiohttp
+from state_cache import StateCache
 
 # === CONFIG ===
 
@@ -49,6 +51,10 @@ try:
     STATE_DB_RAW = config.get("behaviour", "state_db", fallback="rescan.db").strip()
     REPAIR_SCAN_COOLDOWN_HOURS = config.getfloat(
         "behaviour", "repair_scan_cooldown_hours", fallback=24.0
+    )
+    LIBRARY_WORKERS = config.getint("behaviour", "library_workers", fallback=2)
+    METADATA_REPAIR_ENABLED = config.getboolean(
+        "behaviour", "metadata_repair", fallback=False
     )
     directories_raw = config["scan"]["directories"]
 except (KeyError, configparser.NoSectionError) as e:
@@ -105,12 +111,12 @@ library_ids = {}
 library_paths = {}
 # Cache for directory-level searches to minimize API calls
 directory_cache = {}
+directory_cache_lock = threading.Lock()
 # Per-server library cache to avoid redundant API calls
 _library_cache = {}
 # Bulk path cache for Jellyfin/Emby (built once per scan cycle)
 _server_path_caches: dict = {}  # {server_url: set of normalized file paths}
-_state_db_conn = None
-_state_cache_available = STATE_CACHE_ENABLED
+_server_item_caches: dict = {}  # {server_url: {normalized_path: item}}
 
 # ANSI escape codes for text formatting
 BOLD = "\033[1m"
@@ -126,215 +132,9 @@ logger = logging.getLogger(__name__)
 
 # Graceful shutdown support
 _shutdown_requested = False
-
-
-def _get_state_db():
-    global _state_db_conn, _state_cache_available
-
-    if not STATE_CACHE_ENABLED or not _state_cache_available:
-        return None
-
-    if _state_db_conn is not None:
-        return _state_db_conn
-
-    try:
-        db_dir = os.path.dirname(STATE_DB_PATH)
-        if db_dir:
-            os.makedirs(db_dir, exist_ok=True)
-
-        conn = sqlite3.connect(STATE_DB_PATH, timeout=30, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS file_state (
-                path TEXT NOT NULL,
-                server_type TEXT NOT NULL,
-                server_url TEXT NOT NULL,
-                size INTEGER NOT NULL,
-                mtime_ns INTEGER NOT NULL,
-                status TEXT NOT NULL,
-                folder_path TEXT NOT NULL,
-                last_seen_at REAL NOT NULL,
-                last_changed_at REAL NOT NULL,
-                PRIMARY KEY (path, server_type, server_url)
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS scan_queue_state (
-                server_type TEXT NOT NULL,
-                server_url TEXT NOT NULL,
-                folder_path TEXT NOT NULL,
-                last_queued_at REAL,
-                last_processed_at REAL,
-                PRIMARY KEY (server_type, server_url, folder_path)
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_file_state_folder
-            ON file_state (server_type, server_url, folder_path)
-            """
-        )
-        _state_db_conn = conn
-    except (OSError, sqlite3.Error) as e:
-        _state_cache_available = False
-        logger.warning(f"[WARN] State cache disabled: {e}")
-        return None
-
-    return _state_db_conn
-
-
-def _file_signature(file_path):
-    try:
-        stat_result = os.stat(file_path)
-    except OSError as e:
-        logger.debug(f"[CACHE] Could not stat {file_path}: {e}")
-        return None
-
-    return stat_result.st_size, stat_result.st_mtime_ns
-
-
-def _repair_scan_cooldown_seconds():
-    return max(0.0, REPAIR_SCAN_COOLDOWN_HOURS * 3600)
-
-
-def _recent_repair_scan_applies(
-    conn, file_path, server_status, parent_folder, signature, now
-):
-    cooldown_seconds = _repair_scan_cooldown_seconds()
-    if cooldown_seconds <= 0:
-        return False
-
-    size, mtime_ns = signature
-    file_row = conn.execute(
-        """
-        SELECT size, mtime_ns, status
-        FROM file_state
-        WHERE path = ? AND server_type = ? AND server_url = ?
-        """,
-        (file_path, server_status["server_type"], server_status["server_url"]),
-    ).fetchone()
-    if not file_row:
-        return False
-    if file_row["status"] != "missing":
-        return False
-    if file_row["size"] != size or file_row["mtime_ns"] != mtime_ns:
-        return False
-
-    scan_row = conn.execute(
-        """
-        SELECT last_processed_at
-        FROM scan_queue_state
-        WHERE server_type = ? AND server_url = ? AND folder_path = ?
-        """,
-        (server_status["server_type"], server_status["server_url"], parent_folder),
-    ).fetchone()
-    if not scan_row or scan_row["last_processed_at"] is None:
-        return False
-
-    return now - float(scan_row["last_processed_at"]) < cooldown_seconds
-
-
-def _record_missing_file_state(
-    conn, file_path, server_status, parent_folder, signature, now
-):
-    if not conn or not signature:
-        return
-
-    size, mtime_ns = signature
-    previous = conn.execute(
-        """
-        SELECT size, mtime_ns, last_changed_at
-        FROM file_state
-        WHERE path = ? AND server_type = ? AND server_url = ?
-        """,
-        (file_path, server_status["server_type"], server_status["server_url"]),
-    ).fetchone()
-    if previous and previous["size"] == size and previous["mtime_ns"] == mtime_ns:
-        last_changed_at = previous["last_changed_at"]
-    else:
-        last_changed_at = now
-
-    conn.execute(
-        """
-        INSERT INTO file_state (
-            path, server_type, server_url, size, mtime_ns, status, folder_path,
-            last_seen_at, last_changed_at
-        )
-        VALUES (?, ?, ?, ?, ?, 'missing', ?, ?, ?)
-        ON CONFLICT(path, server_type, server_url) DO UPDATE SET
-            size = excluded.size,
-            mtime_ns = excluded.mtime_ns,
-            status = excluded.status,
-            folder_path = excluded.folder_path,
-            last_seen_at = excluded.last_seen_at,
-            last_changed_at = excluded.last_changed_at
-        """,
-        (
-            file_path,
-            server_status["server_type"],
-            server_status["server_url"],
-            size,
-            mtime_ns,
-            parent_folder,
-            now,
-            last_changed_at,
-        ),
-    )
-
-
-def _mark_scan_queued(scan_request, now=None):
-    conn = _get_state_db()
-    if not conn:
-        return
-
-    now = time.time() if now is None else now
-    conn.execute(
-        """
-        INSERT INTO scan_queue_state (
-            server_type, server_url, folder_path, last_queued_at, last_processed_at
-        )
-        VALUES (?, ?, ?, ?, NULL)
-        ON CONFLICT(server_type, server_url, folder_path) DO UPDATE SET
-            last_queued_at = excluded.last_queued_at
-        """,
-        (
-            scan_request["server_type"],
-            scan_request["server_url"],
-            scan_request["folder_path"],
-            now,
-        ),
-    )
-
-
-def _mark_scan_processed(scan_request, now=None):
-    conn = _get_state_db()
-    if not conn:
-        return
-
-    now = time.time() if now is None else now
-    conn.execute(
-        """
-        INSERT INTO scan_queue_state (
-            server_type, server_url, folder_path, last_queued_at, last_processed_at
-        )
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(server_type, server_url, folder_path) DO UPDATE SET
-            last_processed_at = excluded.last_processed_at
-        """,
-        (
-            scan_request["server_type"],
-            scan_request["server_url"],
-            scan_request["folder_path"],
-            now,
-            now,
-        ),
-    )
+state_cache = StateCache(
+    STATE_CACHE_ENABLED, STATE_DB_PATH, REPAIR_SCAN_COOLDOWN_HOURS, logger
+)
 
 
 def _handle_shutdown(signum, frame):
@@ -810,7 +610,8 @@ def _build_server_path_cache(server_info, server_label):
     """Fetch all media item paths from a Jellyfin/Emby server in pages.
 
     Returns a set of normalised absolute paths.
-    Called once per scan cycle; result stored in _server_path_caches.
+    Called once per scan cycle; result stored in _server_path_caches and
+    _server_item_caches.
     """
     url = f"{server_info['url']}/Items"
     headers = {"X-Emby-Token": server_info["token"]}
@@ -818,10 +619,11 @@ def _build_server_path_cache(server_info, server_label):
     base_params = {
         "recursive": "true",
         "includeItemTypes": "Movie,Episode",
-        "fields": "Path,MediaSources",
+        "fields": "Path,MediaSources,ProviderIds,PremiereDate,ProductionYear",
         "enableTotalRecordCount": "true",
     }
     paths: set = set()
+    items_by_path = {}
     start_index = 0
     total_record_count = None
 
@@ -852,10 +654,14 @@ def _build_server_path_cache(server_info, server_label):
 
             for item in items:
                 if "Path" in item:
-                    paths.add(os.path.normpath(item["Path"]))
+                    normalized_path = os.path.normpath(item["Path"])
+                    paths.add(normalized_path)
+                    items_by_path[normalized_path] = item
                 for ms in item.get("MediaSources", []):
                     if "Path" in ms:
-                        paths.add(os.path.normpath(ms["Path"]))
+                        normalized_path = os.path.normpath(ms["Path"])
+                        paths.add(normalized_path)
+                        items_by_path[normalized_path] = item
 
             page_count = len(items)
             start_index += page_count
@@ -876,6 +682,7 @@ def _build_server_path_cache(server_info, server_label):
         )
     except Exception as e:
         logger.error(f"[FAIL] {server_label} | Could not build path cache: {e}")
+    _server_item_caches[server_info["url"]] = items_by_path
     return paths
 
 
@@ -1232,6 +1039,43 @@ def check_file_emby(file_path, library_info, server_info):
     return os.path.normpath(file_path) in _server_path_caches[server_url]
 
 
+def _get_cached_server_item(server_url, file_path):
+    return _server_item_caches.get(server_url, {}).get(os.path.normpath(file_path))
+
+
+def _item_has_incomplete_metadata(item):
+    if not item:
+        return False
+
+    provider_ids = item.get("ProviderIds") or {}
+    return (
+        not provider_ids
+        and not item.get("ProductionYear")
+        and not item.get("PremiereDate")
+    )
+
+
+def _metadata_refresh_request(file_path, server_info, item):
+    item_id = item.get("Id")
+    if not item_id:
+        return None
+
+    signature = state_cache.file_signature(file_path)
+    if not signature:
+        return None
+
+    size, mtime_ns = signature
+    return {
+        "server_type": server_info["type"],
+        "server_url": server_info["url"],
+        "token": server_info["token"],
+        "item_id": item_id,
+        "file_path": file_path,
+        "size": size,
+        "mtime_ns": mtime_ns,
+    }
+
+
 def _is_path_in_library(file_path, library_location):
     normalized_file_path = os.path.normcase(os.path.normpath(file_path))
     normalized_location = os.path.normcase(os.path.normpath(library_location))
@@ -1261,8 +1105,7 @@ def _should_walk_path(path, library_roots):
         return True
 
     return any(
-        _is_path_parent_of(path, library_root)
-        or _is_path_parent_of(library_root, path)
+        _is_path_parent_of(path, library_root) or _is_path_parent_of(library_root, path)
         for library_root in library_roots
     )
 
@@ -1270,7 +1113,7 @@ def _should_walk_path(path, library_roots):
 def _skip_unmatched_library_status(server_info, file_path):
     server_type = server_info["type"]
     server_url = server_info["url"]
-    logger.info(
+    logger.debug(
         f"[SKIP] {server_type.capitalize()} | No matching library for: {file_path}"
     )
     return {
@@ -1280,6 +1123,7 @@ def _skip_unmatched_library_status(server_info, file_path):
         "skipped": True,
         "library_info": None,
         "token": server_info["token"],
+        "metadata_refresh": None,
     }
 
 
@@ -1303,8 +1147,9 @@ def check_file_in_all_servers(file_path):
     """
     # Check cache first for this specific file
     cache_key = f"server_status:{file_path}"
-    if cache_key in directory_cache:
-        cached_result = directory_cache[cache_key]
+    with directory_cache_lock:
+        cached_result = directory_cache.get(cache_key)
+    if cached_result:
         if isinstance(cached_result, dict) and "found_anywhere" in cached_result:
             logger.debug(f"[CACHE] Hit for: {os.path.basename(file_path)}")
             return cached_result
@@ -1318,6 +1163,7 @@ def check_file_in_all_servers(file_path):
         server_url = server_info["url"]
         found_on_this_server = False
         library_info_for_scan = None
+        metadata_refresh = None
 
         try:
             # Small delay to be respectful to API
@@ -1379,7 +1225,7 @@ def check_file_in_all_servers(file_path):
                             f"[OK] {server_type.capitalize()} | {library_info_for_scan['section_title']} | {filename} ({search_duration:.2f}s)"
                         )
                     else:
-                        logger.info(
+                        logger.debug(
                             f"[MISS] {server_type.capitalize()} | {library_info_for_scan['section_title']} | {filename} ({search_duration:.2f}s)"
                         )
             elif server_type in ["jellyfin", "emby"]:
@@ -1442,12 +1288,21 @@ def check_file_in_all_servers(file_path):
                     found_on_this_server = True
                     found_anywhere = True
                     library_info_for_scan = library_info
+                    if METADATA_REPAIR_ENABLED and server_type in [
+                        "jellyfin",
+                        "emby",
+                    ]:
+                        item = _get_cached_server_item(server_url, file_path)
+                        if _item_has_incomplete_metadata(item):
+                            metadata_refresh = _metadata_refresh_request(
+                                file_path, server_info, item
+                            )
                     logger.debug(
                         f"[OK] {server_type.capitalize()} | {library_name} | {filename} ({search_duration:.2f}s)"
                     )
                 else:
                     library_info_for_scan = library_info
-                    logger.info(
+                    logger.debug(
                         f"[MISS] {server_type.capitalize()} | {library_name} | {filename} ({search_duration:.2f}s)"
                     )
 
@@ -1460,6 +1315,7 @@ def check_file_in_all_servers(file_path):
                     "skipped": False,
                     "library_info": library_info_for_scan,
                     "token": server_info["token"],
+                    "metadata_refresh": metadata_refresh,
                 }
             )
 
@@ -1476,6 +1332,7 @@ def check_file_in_all_servers(file_path):
                     "skipped": False,
                     "library_info": None,
                     "token": server_info["token"],
+                    "metadata_refresh": None,
                 }
             )
             continue
@@ -1483,14 +1340,10 @@ def check_file_in_all_servers(file_path):
     result = {"found_anywhere": found_anywhere, "server_status": server_status_list}
 
     # Cache the result (cap size to prevent unbounded growth)
-    if len(directory_cache) >= 50000:
-        directory_cache.clear()
-    directory_cache[cache_key] = result
-
-    searchable_statuses = [s for s in server_status_list if not s.get("skipped")]
-    if not found_anywhere and searchable_statuses:
-        filename = os.path.basename(file_path)
-        logger.info(f"[MISS] Not indexed on any server: {filename}")
+    with directory_cache_lock:
+        if len(directory_cache) >= 50000:
+            directory_cache.clear()
+        directory_cache[cache_key] = result
 
     return result
 
@@ -1569,6 +1422,106 @@ def scan_folder(library_id, folder_path, server_url, token, server_type):
         return
 
 
+def refresh_item_metadata(refresh_request):
+    server_type = refresh_request["server_type"]
+    if server_type not in ["jellyfin", "emby"]:
+        return False
+
+    item_id = refresh_request["item_id"]
+    url = f"{refresh_request['server_url']}/Items/{item_id}/Refresh"
+    headers = {"X-Emby-Token": refresh_request["token"]}
+    params = {
+        "metadataRefreshMode": "FullRefresh",
+        "imageRefreshMode": "Default",
+        "replaceAllMetadata": "false",
+        "replaceAllImages": "false",
+    }
+
+    refresh_start = time.time()
+    try:
+        response = _request_with_retry(
+            requests.post, url, headers=headers, params=params, timeout=30
+        )
+        refresh_duration = time.time() - refresh_start
+        if response.status_code in [200, 204]:
+            logger.info(
+                f"[OK] {server_type.capitalize()} | Metadata refresh queued "
+                f"({refresh_duration:.2f}s)"
+            )
+            state_cache.mark_metadata_refresh_processed(refresh_request)
+            return True
+
+        logger.warning(
+            f"[WARN] {server_type.capitalize()} | Metadata refresh returned status "
+            f"{response.status_code} ({refresh_duration:.2f}s)"
+        )
+    except requests.exceptions.RequestException as e:
+        refresh_duration = time.time() - refresh_start
+        logger.error(
+            f"[FAIL] {server_type.capitalize()} | Metadata refresh failed: {str(e)} "
+            f"({refresh_duration:.2f}s)"
+        )
+
+    return False
+
+
+def _queue_metadata_refresh(pending_refreshes, refresh_request):
+    if not isinstance(refresh_request, dict):
+        return refresh_request or "none"
+
+    server_status = {
+        "server_type": refresh_request["server_type"],
+        "server_url": refresh_request["server_url"],
+    }
+    signature = (refresh_request["size"], refresh_request["mtime_ns"])
+    now = time.time()
+    if state_cache.recent_metadata_refresh_applies(
+        refresh_request["file_path"],
+        server_status,
+        refresh_request["item_id"],
+        signature,
+        now,
+    ):
+        return "cooldown"
+
+    key = (
+        refresh_request["server_type"],
+        refresh_request["server_url"],
+        refresh_request["item_id"],
+    )
+    if key in pending_refreshes:
+        return "pending"
+
+    pending_refreshes[key] = refresh_request
+    state_cache.mark_metadata_refresh_queued(
+        refresh_request["file_path"],
+        server_status,
+        refresh_request["item_id"],
+        signature,
+        now,
+    )
+    return "queued"
+
+
+def process_pending_metadata_refreshes(pending_refreshes):
+    processed = 0
+
+    for refresh_request in pending_refreshes.values():
+        if _shutdown_requested:
+            logger.info("[SHUTDOWN] Metadata refreshes aborted cleanly")
+            break
+
+        server_name = refresh_request["server_type"].capitalize()
+        logger.info(
+            f"[REFRESH] {server_name} | Metadata | "
+            f"{os.path.basename(refresh_request['file_path'])}"
+        )
+        if refresh_item_metadata(refresh_request):
+            processed += 1
+
+    return processed
+
+
 def _queue_scan_request(pending_scans, server_status, parent_folder, file_path=None):
     library_info = server_status["library_info"]
     section_id = library_info.get("section_id") if library_info else None
@@ -1582,24 +1535,22 @@ def _queue_scan_request(pending_scans, server_status, parent_folder, file_path=N
         parent_folder,
     )
 
-    state_conn = None
     signature = None
     now = time.time()
     if file_path:
-        state_conn = _get_state_db()
-        signature = _file_signature(file_path) if state_conn else None
+        signature = state_cache.file_signature(file_path)
 
     if key in pending_scans:
-        _record_missing_file_state(
-            state_conn, file_path, server_status, parent_folder, signature, now
+        state_cache.record_missing_file(
+            file_path, server_status, parent_folder, signature, now
         )
         return "pending"
 
-    if signature and _recent_repair_scan_applies(
-        state_conn, file_path, server_status, parent_folder, signature, now
+    if state_cache.recent_repair_scan_applies(
+        file_path, server_status, parent_folder, signature, now
     ):
-        _record_missing_file_state(
-            state_conn, file_path, server_status, parent_folder, signature, now
+        state_cache.record_missing_file(
+            file_path, server_status, parent_folder, signature, now
         )
         return "cooldown"
 
@@ -1610,9 +1561,9 @@ def _queue_scan_request(pending_scans, server_status, parent_folder, file_path=N
         "token": server_status["token"],
         "server_type": server_status["server_type"],
     }
-    _mark_scan_queued(pending_scans[key], now)
-    _record_missing_file_state(
-        state_conn, file_path, server_status, parent_folder, signature, now
+    state_cache.mark_scan_queued(pending_scans[key], now)
+    state_cache.record_missing_file(
+        file_path, server_status, parent_folder, signature, now
     )
     return "queued"
 
@@ -1634,7 +1585,7 @@ def process_pending_scans(pending_scans):
             scan_request["token"],
             scan_request["server_type"],
         )
-        _mark_scan_processed(scan_request)
+        state_cache.mark_scan_processed(scan_request)
         processed += 1
 
         if SCAN_INTERVAL > 0:
@@ -1654,14 +1605,170 @@ def is_broken_symlink(file_path):
     return False, None
 
 
+def _get_walk_roots(scan_path, library_roots):
+    if not library_roots:
+        return [scan_path]
+
+    roots = []
+    for library_root in library_roots:
+        if _is_path_parent_of(scan_path, library_root):
+            roots.append(library_root)
+        elif _is_path_parent_of(library_root, scan_path):
+            roots.append(scan_path)
+
+    deduped_roots = []
+    seen = set()
+    for root in sorted(roots, key=len):
+        normalized_root = os.path.normcase(os.path.normpath(root))
+        if normalized_root in seen:
+            continue
+        if any(_is_path_parent_of(existing, root) for existing in deduped_roots):
+            continue
+        seen.add(normalized_root)
+        deduped_roots.append(root)
+    return deduped_roots
+
+
+def _log_pruned_scan_children(scan_path, walk_roots):
+    try:
+        children = os.listdir(scan_path)
+    except OSError:
+        return 0
+
+    pruned = 0
+    for child in children:
+        child_path = os.path.join(scan_path, child)
+        if not os.path.isdir(child_path):
+            continue
+        if any(_is_path_parent_of(child_path, root) for root in walk_roots):
+            continue
+        if any(_is_path_parent_of(root, child_path) for root in walk_roots):
+            continue
+        pruned += 1
+        logger.info(f"[SKIP] Pruned non-library directory: {child_path}")
+    return pruned
+
+
+def _scan_walk_root(walk_root):
+    result = {
+        "files": 0,
+        "directories": 0,
+        "broken_symlinks": 0,
+        "missing_events": [],
+        "metadata_events": [],
+        "missing_items": [],
+        "warnings": [],
+        "skipped_no_library": 0,
+        "metadata_cooldown_skips": 0,
+    }
+
+    for root, dirs, files in os.walk(walk_root):
+        result["directories"] += 1
+        media_files_in_dir = 0
+
+        if SYMLINK_CHECK:
+            for d in dirs[:]:
+                dir_path = os.path.join(root, d)
+                broken, target = is_broken_symlink(dir_path)
+                if broken:
+                    target_info = f" -> {target}" if target else ""
+                    logger.warning(f"[SKIP] Broken directory symlink: {d}{target_info}")
+                    result["broken_symlinks"] += 1
+                    dirs.remove(d)
+
+        for file in files:
+            if file.startswith("."):
+                continue
+
+            file_ext = os.path.splitext(file)[1].lower()
+            if file_ext not in MEDIA_EXTENSIONS:
+                continue
+
+            result["files"] += 1
+            media_files_in_dir += 1
+            file_path = os.path.join(root, file)
+
+            if SYMLINK_CHECK:
+                broken, target = is_broken_symlink(file_path)
+                if broken:
+                    target_info = f" -> {target}" if target else ""
+                    logger.warning(
+                        f"[SKIP] Broken symlink: {os.path.basename(file_path)}"
+                        f"{target_info}"
+                    )
+                    result["broken_symlinks"] += 1
+                    continue
+
+            if result["files"] % 100 == 0:
+                logger.info(
+                    f"[PROGRESS] {result['files']} files checked in {walk_root}"
+                )
+
+            file_status = check_file_in_all_servers(file_path)
+            filename = os.path.basename(file_path)
+            missing_servers = [
+                s
+                for s in file_status["server_status"]
+                if not s["found"] and not s.get("skipped")
+            ]
+            skipped_servers = [
+                s for s in file_status["server_status"] if s.get("skipped")
+            ]
+
+            for server_status in file_status["server_status"]:
+                refresh_request = server_status.get("metadata_refresh")
+                if refresh_request == "cooldown":
+                    result["metadata_cooldown_skips"] += 1
+                elif refresh_request:
+                    result["metadata_events"].append(refresh_request)
+
+            if missing_servers:
+                if not file_status["found_anywhere"]:
+                    library_info = get_library_id_for_path(file_path)
+                    if library_info and library_info.get("section_title"):
+                        result["missing_items"].append(
+                            (library_info["section_title"], file_path)
+                        )
+                        logger.debug(f"[MISS] Not indexed on any server: {filename}")
+
+                parent_folder = os.path.dirname(file_path)
+                for server_status in missing_servers:
+                    if server_status["library_info"]:
+                        result["missing_events"].append(
+                            (server_status, parent_folder, file_path)
+                        )
+                    else:
+                        warning_msg = (
+                            f"[WARN] Could not determine library for {filename} on "
+                            f"{server_status['server_type']}"
+                        )
+                        logger.warning(warning_msg)
+                        result["warnings"].append(warning_msg)
+            elif skipped_servers:
+                result["skipped_no_library"] += 1
+                logger.debug(f"[SKIP] No matching library on all servers: {filename}")
+            else:
+                logger.debug(f"[OK] Exists on all servers: {filename}")
+
+        if media_files_in_dir > 0:
+            logger.debug(
+                f"[OK] Directory done: {os.path.basename(root)} "
+                f"({media_files_in_dir} files)"
+            )
+
+    return result
+
+
 def run_scan():
     """Main scan logic."""
     stats = RunStats()
     scan_start_time = time.time()
 
     # Clear directory cache at the start of a new scan
-    directory_cache.clear()
+    with directory_cache_lock:
+        directory_cache.clear()
     _server_path_caches.clear()
+    _server_item_caches.clear()
     logger.info("--- SCAN CYCLE START ---")
 
     library_ids = get_library_ids()
@@ -1684,10 +1791,21 @@ def run_scan():
     )
     logger.info(f"Found {len(library_ids)} libraries across {server_summary}")
     library_roots = _get_library_roots()
+    for server_info in media_servers:
+        if server_info["type"] == "jellyfin":
+            _server_path_caches[server_info["url"]] = _build_server_path_cache(
+                server_info, "Jellyfin"
+            )
+        elif server_info["type"] == "emby":
+            _server_path_caches[server_info["url"]] = _build_server_path_cache(
+                server_info, "Emby"
+            )
     pending_scans = {}
+    pending_metadata_refreshes = {}
     pruned_directories = 0
     skipped_no_library = 0
     cooldown_skipped_scans = 0
+    metadata_cooldown_skipped = 0
     total_files_found = 0
     total_directories_searched = 0
 
@@ -1707,150 +1825,120 @@ def run_scan():
             logger.info(f"[SKIP] No configured library under scan path: {SCAN_PATH}")
             continue
 
+        walk_roots = _get_walk_roots(SCAN_PATH, library_roots)
+        pruned_directories += _log_pruned_scan_children(SCAN_PATH, walk_roots)
+
+        if not walk_roots:
+            logger.info(f"[SKIP] No configured library under scan path: {SCAN_PATH}")
+            continue
+
         files_in_path = 0
         directories_in_path = 0
+        worker_count = max(1, min(LIBRARY_WORKERS, len(walk_roots)))
+        logger.info(
+            f"[WORKERS] Scanning {len(walk_roots)} libraries with {worker_count} workers"
+        )
 
-        for root, dirs, files in os.walk(SCAN_PATH):
-            directories_in_path += 1
-            media_files_in_dir = 0
+        if worker_count == 1:
+            scan_results = [_scan_walk_root(walk_roots[0])]
+        else:
+            scan_results = []
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                future_to_root = {
+                    executor.submit(_scan_walk_root, walk_root): walk_root
+                    for walk_root in walk_roots
+                }
+                for future in as_completed(future_to_root):
+                    walk_root = future_to_root[future]
+                    try:
+                        scan_results.append(future.result())
+                    except Exception as e:
+                        error_msg = f"Library worker failed for {walk_root}: {e}"
+                        logger.error(f"[FAIL] {error_msg}", exc_info=True)
+                        stats.add_error(error_msg)
 
-            kept_dirs = []
-            for d in dirs:
-                dir_path = os.path.join(root, d)
-                if _should_walk_path(dir_path, library_roots):
-                    kept_dirs.append(d)
-                else:
-                    pruned_directories += 1
-                    logger.info(f"[SKIP] Pruned non-library directory: {dir_path}")
-            dirs[:] = kept_dirs
-
-            # Check for broken directory symlinks
-            if SYMLINK_CHECK:
-                for d in dirs[:]:  # iterate over a copy since we may remove
-                    dir_path = os.path.join(root, d)
-                    broken, target = is_broken_symlink(dir_path)
-                    if broken:
-                        target_info = f" -> {target}" if target else ""
-                        logger.warning(
-                            f"[SKIP] Broken directory symlink: {d}{target_info}"
-                        )
-                        stats.increment_broken_symlinks()
-                        dirs.remove(d)
-
-            root_in_library = not library_roots or any(
-                _is_path_parent_of(library_root, root)
-                for library_root in library_roots
-            )
-            if not root_in_library:
-                continue
-
-            for file in files:
-                if file.startswith("."):
-                    continue  # skip hidden/system files
-
-                file_ext = os.path.splitext(file)[1].lower()
-                if file_ext not in MEDIA_EXTENSIONS:
-                    continue  # skip non-media files
-
-                files_in_path += 1
-                media_files_in_dir += 1
-                file_path = os.path.join(root, file)
-
-                # Check for broken symlinks if enabled
-                if SYMLINK_CHECK:
-                    broken, target = is_broken_symlink(file_path)
-                    if broken:
-                        target_info = f" -> {target}" if target else ""
-                        logger.warning(
-                            f"[SKIP] Broken symlink: {os.path.basename(file_path)}{target_info}"
-                        )
-                        stats.increment_broken_symlinks()
-                        continue
-
+        missing_events_by_folder = defaultdict(list)
+        metadata_refresh_count = 0
+        for scan_result in scan_results:
+            files_in_path += scan_result["files"]
+            directories_in_path += scan_result["directories"]
+            skipped_no_library += scan_result["skipped_no_library"]
+            metadata_cooldown_skipped += scan_result["metadata_cooldown_skips"]
+            for _ in range(scan_result["files"]):
                 stats.increment_scanned()
-
-                # Log progress every 100 files
-                if files_in_path % 100 == 0:
-                    logger.info(
-                        f"[PROGRESS] {files_in_path} files checked in {SCAN_PATH}"
-                    )
-
-                # Check file in all servers
-                file_status = check_file_in_all_servers(file_path)
-
-                filename = os.path.basename(file_path)
-
-                # Check if file is missing from any server
-                missing_servers = [
-                    s
-                    for s in file_status["server_status"]
-                    if not s["found"] and not s.get("skipped")
-                ]
-                skipped_servers = [
-                    s for s in file_status["server_status"] if s.get("skipped")
-                ]
-
-                if missing_servers:
-                    # File is missing from at least one server
-                    if not file_status["found_anywhere"]:
-                        # File not found in any server - use path-based matching for reporting
-                        library_info = get_library_id_for_path(file_path)
-                        if library_info and library_info.get("section_title"):
-                            stats.add_missing_item(
-                                library_info["section_title"], file_path
-                            )
-                            logger.info(f"[MISS] Not indexed on any server: {filename}")
-
-                    # Queue scans on servers where file was not found.
-                    parent_folder = os.path.dirname(file_path)
-                    for server_status in missing_servers:
-                        if server_status["library_info"]:
-                            server_name = server_status["server_type"].capitalize()
-                            queue_result = _queue_scan_request(
-                                pending_scans, server_status, parent_folder, file_path
-                            )
-                            if queue_result == "queued":
-                                logger.info(f"[QUEUE] {server_name} | {parent_folder}")
-                            elif queue_result == "cooldown":
-                                cooldown_skipped_scans += 1
-                                logger.debug(
-                                    f"[CACHE] {server_name} | Repair cooldown active: "
-                                    f"{filename}"
-                                )
-                        else:
-                            warning_msg = f"[WARN] Could not determine library for {filename} on {server_status['server_type']}"
-                            logger.warning(warning_msg)
-                            stats.add_warning(warning_msg)
-                elif skipped_servers:
-                    skipped_no_library += 1
-                    logger.debug(
-                        f"[SKIP] No matching library on all servers: {filename}"
-                    )
-                else:
-                    logger.debug(f"[OK] Exists on all servers: {filename}")
-
-            # Log directory completion if it had media files
-            if media_files_in_dir > 0:
-                logger.debug(
-                    f"[OK] Directory done: {os.path.basename(root)} ({media_files_in_dir} files)"
+            for _ in range(scan_result["broken_symlinks"]):
+                stats.increment_broken_symlinks()
+            for section_title, file_path in scan_result["missing_items"]:
+                stats.add_missing_item(section_title, file_path)
+            for warning_msg in scan_result["warnings"]:
+                stats.add_warning(warning_msg)
+            for server_status, parent_folder, file_path in scan_result[
+                "missing_events"
+            ]:
+                key = (
+                    server_status["server_type"],
+                    server_status["server_url"],
+                    parent_folder,
                 )
+                missing_events_by_folder[key].append(
+                    (server_status, parent_folder, file_path)
+                )
+            for refresh_request in scan_result["metadata_events"]:
+                queue_result = _queue_metadata_refresh(
+                    pending_metadata_refreshes, refresh_request
+                )
+                if queue_result == "queued":
+                    metadata_refresh_count += 1
+                elif queue_result == "cooldown":
+                    metadata_cooldown_skipped += 1
+
+        for events in missing_events_by_folder.values():
+            server_status, parent_folder, _ = events[0]
+            server_name = server_status["server_type"].capitalize()
+            queued = False
+            cooldowns = 0
+            for _, _, file_path in events:
+                queue_result = _queue_scan_request(
+                    pending_scans, server_status, parent_folder, file_path
+                )
+                if queue_result == "queued":
+                    queued = True
+                elif queue_result == "cooldown":
+                    cooldowns += 1
+
+            if queued:
+                logger.info(
+                    f"[QUEUE] {server_name} | {parent_folder} "
+                    f"({len(events)} missing files)"
+                )
+            cooldown_skipped_scans += cooldowns
+
+        if metadata_refresh_count:
+            logger.info(f"[QUEUE] Metadata refreshes: {metadata_refresh_count}")
 
         total_files_found += files_in_path
         total_directories_searched += directories_in_path
         logger.info(
-            f"[DONE] {SCAN_PATH} - {files_in_path} files in {directories_in_path} directories"
+            f"[DONE] {SCAN_PATH} - {files_in_path} files in "
+            f"{directories_in_path} directories"
         )
 
     processed_scans = process_pending_scans(pending_scans)
+    processed_metadata_refreshes = process_pending_metadata_refreshes(
+        pending_metadata_refreshes
+    )
     scan_duration = time.time() - scan_start_time
     logger.info("--- SCAN SUMMARY ---")
     logger.info(f" Files checked:       {total_files_found}")
     logger.info(f" Directories:         {total_directories_searched}")
     logger.info(f" Rescans queued:      {len(pending_scans)}")
     logger.info(f" Rescans processed:   {processed_scans}")
+    logger.info(f" Metadata queued:     {len(pending_metadata_refreshes)}")
+    logger.info(f" Metadata processed:  {processed_metadata_refreshes}")
     logger.info(f" Pruned directories:  {pruned_directories}")
     logger.info(f" Skipped no library:  {skipped_no_library}")
     logger.info(f" Repair cooldown skips: {cooldown_skipped_scans}")
+    logger.info(f" Metadata cooldown skips: {metadata_cooldown_skipped}")
     logger.info(f" Missing files:       {stats.total_missing}")
     logger.info(f" Broken symlinks:     {stats.broken_symlinks}")
     logger.info(f" Duration:            {scan_duration:.1f}s")
@@ -1884,6 +1972,10 @@ def main():
     logger.info(f" Paths:    {paths_str}")
     logger.info(f" Interval: Every {RUN_INTERVAL} hours")
     logger.info(f" Symlinks: Checking {symlink_str}")
+    logger.info(f" Workers:  {max(1, LIBRARY_WORKERS)} library workers")
+    logger.info(
+        f" Metadata: Repair {'enabled' if METADATA_REPAIR_ENABLED else 'disabled'}"
+    )
     logger.info("========================================")
 
     # Run immediately on startup

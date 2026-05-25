@@ -5,6 +5,7 @@ WORKDIR /app
 # Copy application files
 COPY requirements.txt /app/requirements.txt
 COPY rescan.py /app/rescan.py
+COPY state_cache.py /app/state_cache.py
 
 # Install dependencies
 RUN pip install --no-cache-dir -r /app/requirements.txt
