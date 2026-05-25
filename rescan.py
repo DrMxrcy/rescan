@@ -17,8 +17,13 @@ import aiohttp
 
 # === CONFIG ===
 
+import argparse as _argparse
+_parser = _argparse.ArgumentParser(description='Rescan media library scanner', add_help=False)
+_parser.add_argument('--config', default='config.ini', help='Path to config.ini')
+_args, _ = _parser.parse_known_args()
+
 config = configparser.ConfigParser()
-config.read('config.ini')
+config.read(_args.config)
 
 try:
     LOG_LEVEL = config['logs']['loglevel']
@@ -33,6 +38,8 @@ except (KeyError, configparser.NoSectionError) as e:
     sys.exit(1)
 
 DISCORD_WEBHOOK_URL = config.get('notifications', 'discord_webhook_url', fallback='')
+# Environment variable overrides (take precedence over config.ini)
+DISCORD_WEBHOOK_URL = os.environ.get('DISCORD_WEBHOOK_URL', DISCORD_WEBHOOK_URL)
 DISCORD_AVATAR_URL = "https://raw.githubusercontent.com/pukabyte/rescan/master/assets/logo.png"
 DISCORD_WEBHOOK_NAME = "Rescan"
 
@@ -154,7 +161,7 @@ if 'plex' in config:
     elif 'server' in config['plex'] and 'token' in config['plex']:
         # Old format: single server (backward compatible)
         PLEX_URL = config['plex']['server']
-        TOKEN = config['plex']['token']
+        TOKEN = os.environ.get('PLEX_TOKEN', config['plex']['token'])
         try:
             plex_server = PlexServer(PLEX_URL, TOKEN)
             media_servers.append({
@@ -185,7 +192,7 @@ if 'jellyfin' in config:
         media_servers.append({
             'type': 'jellyfin',
             'url': config['jellyfin']['server'],
-            'token': config['jellyfin']['token']
+            'token': os.environ.get('JELLYFIN_TOKEN', config['jellyfin']['token'])
         })
         logger.info(f"[OK] Connected to Jellyfin: {config['jellyfin']['server']}")
 
