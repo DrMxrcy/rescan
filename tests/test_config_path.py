@@ -22,7 +22,11 @@ class ConfigPathStartupTest(unittest.TestCase):
             outside_library_dir.mkdir(parents=True)
             config_dir.mkdir()
             (library_dir / "example.mkv").write_text("", encoding="utf-8")
-            (outside_library_dir / "outside.mkv").write_text("", encoding="utf-8")
+            (library_dir / "missing.mkv").write_text("", encoding="utf-8")
+            for index in range(3):
+                (outside_library_dir / f"outside-{index}.mkv").write_text(
+                    "", encoding="utf-8"
+                )
             self._write_dependency_stubs(stubs_dir)
 
             (config_dir / "config.ini").write_text(
@@ -39,7 +43,7 @@ class ConfigPathStartupTest(unittest.TestCase):
                     directories = {scan_dir}
 
                     [behaviour]
-                    scan_interval = 5
+                    scan_interval = 0
                     run_interval = 24
                     symlink_check = false
 
@@ -72,10 +76,17 @@ class ConfigPathStartupTest(unittest.TestCase):
             output,
         )
         self.assertIn("[CACHE] Jellyfin | Cached 1 paths", output)
-        self.assertIn("[SKIP] Jellyfin | No matching library for:", output)
-        self.assertIn("outside.mkv", output)
-        self.assertNotIn("[MISS] Jellyfin | All Libraries | outside.mkv", output)
+        self.assertIn("[SKIP] Pruned non-library directory:", output)
+        self.assertNotIn("outside-0.mkv", output)
+        self.assertNotIn("[MISS] Jellyfin | All Libraries | outside-0.mkv", output)
         self.assertNotIn(f"[SCAN] Jellyfin | {outside_library_dir}", output)
+        self.assertIn(f"[QUEUE] Jellyfin | {library_dir}", output)
+        self.assertIn(f"[SCAN] Jellyfin | {library_dir}", output)
+        self.assertLess(
+            output.index(f"[DONE] {scan_dir}"),
+            output.index(f"[SCAN] Jellyfin | {library_dir}"),
+        )
+        self.assertIn(" Rescans queued:      1", output)
 
     def _write_dependency_stubs(self, stubs_dir):
         (stubs_dir / "plexapi").mkdir(parents=True)

@@ -710,6 +710,15 @@ def get_library_ids():
     return library_ids
 
 
+def _get_library_roots():
+    roots = []
+    for libraries in _library_cache.values():
+        for library in libraries:
+            for location in library.get("locations", []):
+                roots.append(os.path.normpath(location))
+    return roots
+
+
 def get_library_id_for_path(file_path):
     """Get the library section ID and server info for a given file path."""
     best_match = None
@@ -741,8 +750,8 @@ def get_library_id_for_path(file_path):
                     normalized_scan_path = os.path.normpath(file_path)
                     normalized_location = os.path.normpath(location_path)
 
-                    # Check if the file path starts with the library location
-                    if normalized_scan_path.startswith(normalized_location):
+                    # Check if the file path is inside the library location.
+                    if _is_path_in_library(normalized_scan_path, normalized_location):
                         # Use the longest matching path (most specific)
                         if len(normalized_location) > best_match_length:
                             best_match = {
@@ -1011,6 +1020,29 @@ def _is_path_in_library(file_path, library_location):
         )
     except ValueError:
         return False
+
+
+def _is_path_parent_of(parent_path, child_path):
+    normalized_parent = os.path.normcase(os.path.normpath(parent_path))
+    normalized_child = os.path.normcase(os.path.normpath(child_path))
+    try:
+        return (
+            os.path.commonpath([normalized_parent, normalized_child])
+            == normalized_parent
+        )
+    except ValueError:
+        return False
+
+
+def _should_walk_path(path, library_roots):
+    if not library_roots:
+        return True
+
+    return any(
+        _is_path_parent_of(path, library_root)
+        or _is_path_parent_of(library_root, path)
+        for library_root in library_roots
+    )
 
 
 def _skip_unmatched_library_status(server_info, file_path):
@@ -1314,8 +1346,56 @@ def scan_folder(library_id, folder_path, server_url, token, server_type):
         logger.warning(f"[WARN] Unknown server type: {server_type}")
         return
 
-    logger.info(f"[WAIT] {SCAN_INTERVAL}s before next scan")
-    time.sleep(SCAN_INTERVAL)  # Wait between scans
+
+def _queue_scan_request(pending_scans, server_status, parent_folder):
+    library_info = server_status["library_info"]
+    section_id = library_info.get("section_id") if library_info else None
+
+    if server_status["server_type"] == "plex" and not section_id:
+        return False
+
+    key = (
+        server_status["server_type"],
+        server_status["server_url"],
+        parent_folder,
+    )
+    if key in pending_scans:
+        return False
+
+    pending_scans[key] = {
+        "section_id": section_id or "",
+        "folder_path": parent_folder,
+        "server_url": server_status["server_url"],
+        "token": server_status["token"],
+        "server_type": server_status["server_type"],
+    }
+    return True
+
+
+def process_pending_scans(pending_scans):
+    processed = 0
+
+    for scan_request in pending_scans.values():
+        if _shutdown_requested:
+            logger.info("[SHUTDOWN] Pending scans aborted cleanly")
+            break
+
+        server_name = scan_request["server_type"].capitalize()
+        logger.info(f"[SCAN] {server_name} | {scan_request['folder_path']}")
+        scan_folder(
+            scan_request["section_id"],
+            scan_request["folder_path"],
+            scan_request["server_url"],
+            scan_request["token"],
+            scan_request["server_type"],
+        )
+        processed += 1
+
+        if SCAN_INTERVAL > 0:
+            logger.info(f"[WAIT] {SCAN_INTERVAL}s before next scan")
+            time.sleep(SCAN_INTERVAL)
+
+    return processed
 
 
 def is_broken_symlink(file_path):
@@ -1357,7 +1437,10 @@ def run_scan():
         [f"{count} {server_type}" for server_type, count in server_counts.items()]
     )
     logger.info(f"Found {len(library_ids)} libraries across {server_summary}")
-    scanned_folders = set()
+    library_roots = _get_library_roots()
+    pending_scans = {}
+    pruned_directories = 0
+    skipped_no_library = 0
     total_files_found = 0
     total_directories_searched = 0
 
@@ -1373,12 +1456,26 @@ def run_scan():
             stats.add_error(error_msg)
             continue
 
+        if not _should_walk_path(SCAN_PATH, library_roots):
+            logger.info(f"[SKIP] No configured library under scan path: {SCAN_PATH}")
+            continue
+
         files_in_path = 0
         directories_in_path = 0
 
         for root, dirs, files in os.walk(SCAN_PATH):
             directories_in_path += 1
             media_files_in_dir = 0
+
+            kept_dirs = []
+            for d in dirs:
+                dir_path = os.path.join(root, d)
+                if _should_walk_path(dir_path, library_roots):
+                    kept_dirs.append(d)
+                else:
+                    pruned_directories += 1
+                    logger.info(f"[SKIP] Pruned non-library directory: {dir_path}")
+            dirs[:] = kept_dirs
 
             # Check for broken directory symlinks
             if SYMLINK_CHECK:
@@ -1392,6 +1489,13 @@ def run_scan():
                         )
                         stats.increment_broken_symlinks()
                         dirs.remove(d)
+
+            root_in_library = not library_roots or any(
+                _is_path_parent_of(library_root, root)
+                for library_root in library_roots
+            )
+            if not root_in_library:
+                continue
 
             for file in files:
                 if file.startswith("."):
@@ -1450,47 +1554,26 @@ def run_scan():
                             )
                             logger.info(f"[MISS] Not indexed on any server: {filename}")
 
-                    # Trigger scans on servers where file was not found
+                    # Queue scans on servers where file was not found.
                     parent_folder = os.path.dirname(file_path)
                     for server_status in missing_servers:
                         if server_status["library_info"]:
-                            server_key = f"{server_status['server_type']}:{server_status['server_url']}"
-                            folder_key = f"{server_key}:{parent_folder}"
-
-                            if folder_key not in scanned_folders:
-                                library_info = server_status["library_info"]
-                                section_id = (
-                                    library_info.get("section_id")
-                                    if library_info
-                                    else None
-                                )
-
-                                # For Jellyfin/Emby, we can scan even without section_id since we use path-based scanning
-                                # For Plex, we need section_id
-                                if section_id or server_status["server_type"] in [
-                                    "jellyfin",
-                                    "emby",
-                                ]:
-                                    server_name = server_status[
-                                        "server_type"
-                                    ].capitalize()
-                                    logger.info(
-                                        f"[SCAN] {server_name} | {parent_folder}"
-                                    )
-                                    scan_folder(
-                                        section_id or "",
-                                        parent_folder,
-                                        server_status["server_url"],
-                                        server_status["token"],
-                                        server_status["server_type"],
-                                    )
-                                    scanned_folders.add(folder_key)
-                                else:
-                                    warning_msg = f"[WARN] Could not determine library for {filename} on {server_status['server_type']}"
-                                    logger.warning(warning_msg)
-                                    stats.add_warning(warning_msg)
+                            if _queue_scan_request(
+                                pending_scans, server_status, parent_folder
+                            ):
+                                server_name = server_status[
+                                    "server_type"
+                                ].capitalize()
+                                logger.info(f"[QUEUE] {server_name} | {parent_folder}")
+                        else:
+                            warning_msg = f"[WARN] Could not determine library for {filename} on {server_status['server_type']}"
+                            logger.warning(warning_msg)
+                            stats.add_warning(warning_msg)
                 elif skipped_servers:
-                    logger.debug(f"[SKIP] No matching library on all servers: {filename}")
+                    skipped_no_library += 1
+                    logger.debug(
+                        f"[SKIP] No matching library on all servers: {filename}"
+                    )
                 else:
                     logger.debug(f"[OK] Exists on all servers: {filename}")
 
@@ -1506,11 +1589,15 @@ def run_scan():
             f"[DONE] {SCAN_PATH} - {files_in_path} files in {directories_in_path} directories"
         )
 
+    processed_scans = process_pending_scans(pending_scans)
     scan_duration = time.time() - scan_start_time
     logger.info("--- SCAN SUMMARY ---")
     logger.info(f" Files checked:       {total_files_found}")
     logger.info(f" Directories:         {total_directories_searched}")
-    logger.info(f" Rescans triggered:   {len(scanned_folders)}")
+    logger.info(f" Rescans queued:      {len(pending_scans)}")
+    logger.info(f" Rescans processed:   {processed_scans}")
+    logger.info(f" Pruned directories:  {pruned_directories}")
+    logger.info(f" Skipped no library:  {skipped_no_library}")
     logger.info(f" Missing files:       {stats.total_missing}")
     logger.info(f" Broken symlinks:     {stats.broken_symlinks}")
     logger.info(f" Duration:            {scan_duration:.1f}s")
