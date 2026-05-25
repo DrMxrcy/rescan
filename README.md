@@ -73,14 +73,14 @@ docker run -d \
   -v /opt/rescan:/app/config \
   -v /mnt:/mnt \
   -v /etc/localtime:/etc/localtime:ro \
-  ghcr.io/pukabyte/rescan:latest
+  ghcr.io/drmxrcy/rescan:latest
 ```
 
 Or use Docker Compose:
 ```yaml
 services:
   rescan:
-    image: ghcr.io/pukabyte/rescan:latest
+    image: ghcr.io/drmxrcy/rescan:latest
     container_name: rescan
     restart: unless-stopped
     volumes:
