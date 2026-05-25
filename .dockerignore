@@ -1,0 +1,11 @@
+.git
+.github
+__pycache__
+*.pyc
+*.pyo
+docs/
+assets/
+config.ini
+*.md
+.gitignore
+.dockerignore
