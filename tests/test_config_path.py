@@ -59,14 +59,7 @@ class ConfigPathStartupTest(unittest.TestCase):
             env["PYTHONPATH"] = str(stubs_dir)
             env["TEST_LIBRARY_DIR"] = str(library_dir)
 
-            result = subprocess.run(
-                [sys.executable, str(repo_root / "rescan.py")],
-                cwd=tmp_path,
-                env=env,
-                text=True,
-                capture_output=True,
-                timeout=10,
-            )
+            result = self._run_rescan(repo_root, tmp_path, env)
 
         output = result.stdout + result.stderr
         self.assertEqual(result.returncode, 0, output)
@@ -87,6 +80,99 @@ class ConfigPathStartupTest(unittest.TestCase):
             output.index(f"[SCAN] Jellyfin | {library_dir}"),
         )
         self.assertIn(" Rescans queued:      1", output)
+
+    def test_repair_scan_cooldown_skips_unchanged_missing_files(self):
+        repo_root = Path(__file__).resolve().parents[1]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            scan_dir = tmp_path / "media"
+            library_dir = scan_dir / "TV"
+            config_dir = tmp_path / "config"
+            stubs_dir = tmp_path / "stubs"
+            post_log = tmp_path / "posts.log"
+            missing_file = library_dir / "missing.mkv"
+            library_dir.mkdir(parents=True)
+            config_dir.mkdir()
+            (library_dir / "example.mkv").write_text("indexed", encoding="utf-8")
+            missing_file.write_text("", encoding="utf-8")
+            self._write_dependency_stubs(stubs_dir)
+
+            (config_dir / "config.ini").write_text(
+                textwrap.dedent(
+                    f"""
+                    [logs]
+                    loglevel = INFO
+
+                    [jellyfin]
+                    server = http://jellyfin:8096
+                    token = test-token
+
+                    [scan]
+                    directories = {scan_dir}
+
+                    [behaviour]
+                    scan_interval = 0
+                    run_interval = 24
+                    symlink_check = false
+                    state_cache = true
+                    state_db = rescan-test.db
+                    repair_scan_cooldown_hours = 24
+
+                    [notifications]
+                    enabled = false
+                    discord_webhook_url =
+                    """
+                ).strip(),
+                encoding="utf-8",
+            )
+
+            env = os.environ.copy()
+            env["PYTHONPATH"] = str(stubs_dir)
+            env["TEST_LIBRARY_DIR"] = str(library_dir)
+            env["TEST_POST_LOG"] = str(post_log)
+
+            first_result = self._run_rescan(repo_root, tmp_path, env)
+            second_result = self._run_rescan(repo_root, tmp_path, env)
+            missing_file.write_text("changed", encoding="utf-8")
+            third_result = self._run_rescan(repo_root, tmp_path, env)
+
+            post_lines = (
+                post_log.read_text(encoding="utf-8").splitlines()
+                if post_log.exists()
+                else []
+            )
+
+        first_output = first_result.stdout + first_result.stderr
+        second_output = second_result.stdout + second_result.stderr
+        third_output = third_result.stdout + third_result.stderr
+        self.assertEqual(first_result.returncode, 0, first_output)
+        self.assertEqual(second_result.returncode, 0, second_output)
+        self.assertEqual(third_result.returncode, 0, third_output)
+        self.assertIn(f"[QUEUE] Jellyfin | {library_dir}", first_output)
+        self.assertIn(f"[SCAN] Jellyfin | {library_dir}", first_output)
+        self.assertNotIn(f"[QUEUE] Jellyfin | {library_dir}", second_output)
+        self.assertNotIn(f"[SCAN] Jellyfin | {library_dir}", second_output)
+        self.assertIn(" Repair cooldown skips: 1", second_output)
+        self.assertIn(f"[QUEUE] Jellyfin | {library_dir}", third_output)
+        self.assertIn(f"[SCAN] Jellyfin | {library_dir}", third_output)
+        self.assertEqual(
+            post_lines,
+            [
+                "http://jellyfin:8096/Library/Media/Updated",
+                "http://jellyfin:8096/Library/Media/Updated",
+            ],
+        )
+
+    def _run_rescan(self, repo_root, cwd, env):
+        return subprocess.run(
+            [sys.executable, str(repo_root / "rescan.py")],
+            cwd=cwd,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
 
     def _write_dependency_stubs(self, stubs_dir):
         (stubs_dir / "plexapi").mkdir(parents=True)
@@ -164,7 +250,13 @@ class ConfigPathStartupTest(unittest.TestCase):
 
 
                 def post(*args, **kwargs):
-                    return Response()
+                    log_path = os.environ.get("TEST_POST_LOG")
+                    if log_path:
+                        with open(log_path, "a", encoding="utf-8") as handle:
+                            handle.write(str(args[0]) + "\\n")
+                    response = Response()
+                    response.url = args[0]
+                    return response
                 """
             ),
             encoding="utf-8",

@@ -4,6 +4,7 @@ import os
 import sys
 import requests
 import configparser
+import sqlite3
 import xml.etree.ElementTree as ET
 from urllib.parse import quote
 import time
@@ -44,6 +45,11 @@ try:
     RUN_INTERVAL = int(config["behaviour"]["run_interval"])
     SYMLINK_CHECK = config.getboolean("behaviour", "symlink_check", fallback=False)
     NOTIFICATIONS_ENABLED = config.getboolean("notifications", "enabled", fallback=True)
+    STATE_CACHE_ENABLED = config.getboolean("behaviour", "state_cache", fallback=True)
+    STATE_DB_RAW = config.get("behaviour", "state_db", fallback="rescan.db").strip()
+    REPAIR_SCAN_COOLDOWN_HOURS = config.getfloat(
+        "behaviour", "repair_scan_cooldown_hours", fallback=24.0
+    )
     directories_raw = config["scan"]["directories"]
 except (KeyError, configparser.NoSectionError) as e:
     print(
@@ -52,6 +58,11 @@ except (KeyError, configparser.NoSectionError) as e:
     sys.exit(1)
 
 DISCORD_WEBHOOK_URL = config.get("notifications", "discord_webhook_url", fallback="")
+STATE_DB_PATH = STATE_DB_RAW or "rescan.db"
+if not os.path.isabs(STATE_DB_PATH):
+    STATE_DB_PATH = os.path.join(
+        os.path.dirname(os.path.abspath(CONFIG_PATH)), STATE_DB_PATH
+    )
 # Environment variable overrides (take precedence over config.ini)
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", DISCORD_WEBHOOK_URL)
 DISCORD_AVATAR_URL = (
@@ -98,6 +109,8 @@ directory_cache = {}
 _library_cache = {}
 # Bulk path cache for Jellyfin/Emby (built once per scan cycle)
 _server_path_caches: dict = {}  # {server_url: set of normalized file paths}
+_state_db_conn = None
+_state_cache_available = STATE_CACHE_ENABLED
 
 # ANSI escape codes for text formatting
 BOLD = "\033[1m"
@@ -113,6 +126,215 @@ logger = logging.getLogger(__name__)
 
 # Graceful shutdown support
 _shutdown_requested = False
+
+
+def _get_state_db():
+    global _state_db_conn, _state_cache_available
+
+    if not STATE_CACHE_ENABLED or not _state_cache_available:
+        return None
+
+    if _state_db_conn is not None:
+        return _state_db_conn
+
+    try:
+        db_dir = os.path.dirname(STATE_DB_PATH)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
+
+        conn = sqlite3.connect(STATE_DB_PATH, timeout=30, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS file_state (
+                path TEXT NOT NULL,
+                server_type TEXT NOT NULL,
+                server_url TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                mtime_ns INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                folder_path TEXT NOT NULL,
+                last_seen_at REAL NOT NULL,
+                last_changed_at REAL NOT NULL,
+                PRIMARY KEY (path, server_type, server_url)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scan_queue_state (
+                server_type TEXT NOT NULL,
+                server_url TEXT NOT NULL,
+                folder_path TEXT NOT NULL,
+                last_queued_at REAL,
+                last_processed_at REAL,
+                PRIMARY KEY (server_type, server_url, folder_path)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_file_state_folder
+            ON file_state (server_type, server_url, folder_path)
+            """
+        )
+        _state_db_conn = conn
+    except (OSError, sqlite3.Error) as e:
+        _state_cache_available = False
+        logger.warning(f"[WARN] State cache disabled: {e}")
+        return None
+
+    return _state_db_conn
+
+
+def _file_signature(file_path):
+    try:
+        stat_result = os.stat(file_path)
+    except OSError as e:
+        logger.debug(f"[CACHE] Could not stat {file_path}: {e}")
+        return None
+
+    return stat_result.st_size, stat_result.st_mtime_ns
+
+
+def _repair_scan_cooldown_seconds():
+    return max(0.0, REPAIR_SCAN_COOLDOWN_HOURS * 3600)
+
+
+def _recent_repair_scan_applies(
+    conn, file_path, server_status, parent_folder, signature, now
+):
+    cooldown_seconds = _repair_scan_cooldown_seconds()
+    if cooldown_seconds <= 0:
+        return False
+
+    size, mtime_ns = signature
+    file_row = conn.execute(
+        """
+        SELECT size, mtime_ns, status
+        FROM file_state
+        WHERE path = ? AND server_type = ? AND server_url = ?
+        """,
+        (file_path, server_status["server_type"], server_status["server_url"]),
+    ).fetchone()
+    if not file_row:
+        return False
+    if file_row["status"] != "missing":
+        return False
+    if file_row["size"] != size or file_row["mtime_ns"] != mtime_ns:
+        return False
+
+    scan_row = conn.execute(
+        """
+        SELECT last_processed_at
+        FROM scan_queue_state
+        WHERE server_type = ? AND server_url = ? AND folder_path = ?
+        """,
+        (server_status["server_type"], server_status["server_url"], parent_folder),
+    ).fetchone()
+    if not scan_row or scan_row["last_processed_at"] is None:
+        return False
+
+    return now - float(scan_row["last_processed_at"]) < cooldown_seconds
+
+
+def _record_missing_file_state(
+    conn, file_path, server_status, parent_folder, signature, now
+):
+    if not conn or not signature:
+        return
+
+    size, mtime_ns = signature
+    previous = conn.execute(
+        """
+        SELECT size, mtime_ns, last_changed_at
+        FROM file_state
+        WHERE path = ? AND server_type = ? AND server_url = ?
+        """,
+        (file_path, server_status["server_type"], server_status["server_url"]),
+    ).fetchone()
+    if previous and previous["size"] == size and previous["mtime_ns"] == mtime_ns:
+        last_changed_at = previous["last_changed_at"]
+    else:
+        last_changed_at = now
+
+    conn.execute(
+        """
+        INSERT INTO file_state (
+            path, server_type, server_url, size, mtime_ns, status, folder_path,
+            last_seen_at, last_changed_at
+        )
+        VALUES (?, ?, ?, ?, ?, 'missing', ?, ?, ?)
+        ON CONFLICT(path, server_type, server_url) DO UPDATE SET
+            size = excluded.size,
+            mtime_ns = excluded.mtime_ns,
+            status = excluded.status,
+            folder_path = excluded.folder_path,
+            last_seen_at = excluded.last_seen_at,
+            last_changed_at = excluded.last_changed_at
+        """,
+        (
+            file_path,
+            server_status["server_type"],
+            server_status["server_url"],
+            size,
+            mtime_ns,
+            parent_folder,
+            now,
+            last_changed_at,
+        ),
+    )
+
+
+def _mark_scan_queued(scan_request, now=None):
+    conn = _get_state_db()
+    if not conn:
+        return
+
+    now = time.time() if now is None else now
+    conn.execute(
+        """
+        INSERT INTO scan_queue_state (
+            server_type, server_url, folder_path, last_queued_at, last_processed_at
+        )
+        VALUES (?, ?, ?, ?, NULL)
+        ON CONFLICT(server_type, server_url, folder_path) DO UPDATE SET
+            last_queued_at = excluded.last_queued_at
+        """,
+        (
+            scan_request["server_type"],
+            scan_request["server_url"],
+            scan_request["folder_path"],
+            now,
+        ),
+    )
+
+
+def _mark_scan_processed(scan_request, now=None):
+    conn = _get_state_db()
+    if not conn:
+        return
+
+    now = time.time() if now is None else now
+    conn.execute(
+        """
+        INSERT INTO scan_queue_state (
+            server_type, server_url, folder_path, last_queued_at, last_processed_at
+        )
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(server_type, server_url, folder_path) DO UPDATE SET
+            last_processed_at = excluded.last_processed_at
+        """,
+        (
+            scan_request["server_type"],
+            scan_request["server_url"],
+            scan_request["folder_path"],
+            now,
+            now,
+        ),
+    )
 
 
 def _handle_shutdown(signum, frame):
@@ -1347,20 +1569,39 @@ def scan_folder(library_id, folder_path, server_url, token, server_type):
         return
 
 
-def _queue_scan_request(pending_scans, server_status, parent_folder):
+def _queue_scan_request(pending_scans, server_status, parent_folder, file_path=None):
     library_info = server_status["library_info"]
     section_id = library_info.get("section_id") if library_info else None
 
     if server_status["server_type"] == "plex" and not section_id:
-        return False
+        return "missing_library"
 
     key = (
         server_status["server_type"],
         server_status["server_url"],
         parent_folder,
     )
+
+    state_conn = None
+    signature = None
+    now = time.time()
+    if file_path:
+        state_conn = _get_state_db()
+        signature = _file_signature(file_path) if state_conn else None
+
     if key in pending_scans:
-        return False
+        _record_missing_file_state(
+            state_conn, file_path, server_status, parent_folder, signature, now
+        )
+        return "pending"
+
+    if signature and _recent_repair_scan_applies(
+        state_conn, file_path, server_status, parent_folder, signature, now
+    ):
+        _record_missing_file_state(
+            state_conn, file_path, server_status, parent_folder, signature, now
+        )
+        return "cooldown"
 
     pending_scans[key] = {
         "section_id": section_id or "",
@@ -1369,7 +1610,11 @@ def _queue_scan_request(pending_scans, server_status, parent_folder):
         "token": server_status["token"],
         "server_type": server_status["server_type"],
     }
-    return True
+    _mark_scan_queued(pending_scans[key], now)
+    _record_missing_file_state(
+        state_conn, file_path, server_status, parent_folder, signature, now
+    )
+    return "queued"
 
 
 def process_pending_scans(pending_scans):
@@ -1389,6 +1634,7 @@ def process_pending_scans(pending_scans):
             scan_request["token"],
             scan_request["server_type"],
         )
+        _mark_scan_processed(scan_request)
         processed += 1
 
         if SCAN_INTERVAL > 0:
@@ -1441,6 +1687,7 @@ def run_scan():
     pending_scans = {}
     pruned_directories = 0
     skipped_no_library = 0
+    cooldown_skipped_scans = 0
     total_files_found = 0
     total_directories_searched = 0
 
@@ -1558,13 +1805,18 @@ def run_scan():
                     parent_folder = os.path.dirname(file_path)
                     for server_status in missing_servers:
                         if server_status["library_info"]:
-                            if _queue_scan_request(
-                                pending_scans, server_status, parent_folder
-                            ):
-                                server_name = server_status[
-                                    "server_type"
-                                ].capitalize()
+                            server_name = server_status["server_type"].capitalize()
+                            queue_result = _queue_scan_request(
+                                pending_scans, server_status, parent_folder, file_path
+                            )
+                            if queue_result == "queued":
                                 logger.info(f"[QUEUE] {server_name} | {parent_folder}")
+                            elif queue_result == "cooldown":
+                                cooldown_skipped_scans += 1
+                                logger.debug(
+                                    f"[CACHE] {server_name} | Repair cooldown active: "
+                                    f"{filename}"
+                                )
                         else:
                             warning_msg = f"[WARN] Could not determine library for {filename} on {server_status['server_type']}"
                             logger.warning(warning_msg)
@@ -1598,6 +1850,7 @@ def run_scan():
     logger.info(f" Rescans processed:   {processed_scans}")
     logger.info(f" Pruned directories:  {pruned_directories}")
     logger.info(f" Skipped no library:  {skipped_no_library}")
+    logger.info(f" Repair cooldown skips: {cooldown_skipped_scans}")
     logger.info(f" Missing files:       {stats.total_missing}")
     logger.info(f" Broken symlinks:     {stats.broken_symlinks}")
     logger.info(f" Duration:            {scan_duration:.1f}s")
