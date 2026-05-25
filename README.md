@@ -13,56 +13,107 @@
   <a href="https://github.com/Pukabyte/rescan/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/Pukabyte/rescan"></a>
   <a href="https://github.com/Pukabyte/rescan/graphs/contributors"><img alt="Contributors" src="https://img.shields.io/github/contributors/Pukabyte/rescan" /></a>
   <a href="https://discord.gg/vMSnNcd7m5"><img alt="Discord" src="https://img.shields.io/badge/Join%20discord-8A2BE2" /></a>
+  <br/>
+  <a href="https://github.com/Pukabyte/rescan/actions"><img alt="Docker Build" src="https://img.shields.io/github/actions/workflow/status/Pukabyte/rescan/docker-build.yml?label=docker%20build" /></a>
+  <a href="https://github.com/Pukabyte/rescan/actions"><img alt="Lint" src="https://img.shields.io/github/actions/workflow/status/Pukabyte/rescan/lint.yml?label=lint" /></a>
 </div>
 
 <div align="center">
-  <p>Keep your Plex libraries in sync with your media files.</p>
+  <p>Keep your Plex, Jellyfin, and Emby libraries in sync with your media files.</p>
 </div>
 
 # Rescan
 
-Scan your Plex media libraries for missing files and triggers rescans when needed.<br/>
-This is a good once over in case your autoscan tool misses an import or an upgrade from your *arr<br/> 
-It can also provide Discord notification summaries.<br/>
+Scan your media libraries for missing files and trigger rescans when needed.<br/>
+This is a good once-over in case your autoscan tool misses an import or an upgrade from your *arr apps.<br/>
+It can also provide Discord notification summaries with detailed statistics.<br/>
 
 <img alt="rescan" src="assets/discord.png" width="400">
 
 ## Features
 
-- Scans specified directories for media files
-- Checks if files exist in Plex libraries
-- Triggers Plex rescans for missing items
-- Sends Discord notifications with detailed summaries
-- Supports both movie and TV show libraries
-- Configurable scan intervals and behavior
-- Docker support for easy deployment
+- **Multi-server support** — Plex, Jellyfin, and Emby
+- **Multiple servers per platform** — connect several Plex, Jellyfin, or Emby instances at once
+- **Fast Jellyfin/Emby scanning** — bulk path cache for O(1) lookups instead of per-file API calls
+- **Discord notifications** — detailed summaries with library statistics, missing items, and broken symlinks
+- **Docker support** — pre-built multi-arch images (amd64 + arm64) via GitHub Container Registry
+- **Graceful shutdown** — handles SIGTERM/SIGINT cleanly so `docker stop` exits immediately
+- **Flexible configuration** — config file, `--config` CLI flag, or environment variable overrides
+- **Broken symlink detection** — optionally check for and report broken symlinks
+- **Scheduled scanning** — configurable intervals with crash protection and request timeouts
+- **Both movie and TV show libraries** — works across all library types
 
 ## Prerequisites
 
-- Python 3.11 or higher
-- Plex Media Server
-- Discord webhook URL (for notifications)
+- Python 3.11 or higher (for manual installation)
+- Plex Media Server, Jellyfin, or Emby
+- Discord webhook URL (optional, for notifications)
 
-## Installation
+## Quick Start (Docker)
 
-### Docker (Recommended)
+The easiest way to run Rescan is with the pre-built GHCR image.
 
-1. Clone the repository:
+1. Create a directory for your config:
 ```bash
-git clone https://github.com/Pukabyte/rescan.git
-cd rescan
+mkdir -p /opt/rescan
 ```
 
-2. Copy the example config:
+2. Download the example config:
 ```bash
-cp config-example.ini config.ini
+curl -o /opt/rescan/config.ini https://raw.githubusercontent.com/Pukabyte/rescan/main/config-example.ini
 ```
 
-3. Edit `config.ini` with your settings:
+3. Edit `/opt/rescan/config.ini` with your settings (see [Configuration](#configuration)).
+
+4. Run with Docker:
+```bash
+docker run -d \
+  --name rescan \
+  --restart unless-stopped \
+  -v /opt/rescan:/app/config \
+  -v /mnt:/mnt \
+  -v /etc/localtime:/etc/localtime:ro \
+  ghcr.io/pukabyte/rescan:latest
+```
+
+Or use Docker Compose:
+```yaml
+services:
+  rescan:
+    image: ghcr.io/pukabyte/rescan:latest
+    container_name: rescan
+    restart: unless-stopped
+    volumes:
+      - /opt/rescan:/app/config
+      - /mnt:/mnt
+      - /etc/localtime:/etc/localtime:ro
+```
+
+## Configuration
+
+Rescan can be configured via `config.ini`, environment variables, or the `--config` CLI flag.
+
+### Config File (`config.ini`)
+
 ```ini
+[logs]
+loglevel = INFO
+
 [plex]
+# Single server:
 server = http://localhost:32400
 token = your_plex_token_here
+
+# Or multiple servers (comma-separated):
+# servers = http://localhost:32400:token1,http://plex2:32400:token2
+
+[jellyfin]
+server = http://localhost:8096
+token = your_jellyfin_api_token_here
+
+[emby]
+server = http://localhost:8096
+token = your_emby_api_token_here
 
 [scan]
 directories = /path/to/your/media/folder
@@ -77,12 +128,48 @@ enabled = false
 discord_webhook_url = your_discord_webhook_url_here
 ```
 
-4. Run with Docker Compose:
+### Environment Variables
+
+You can override key settings via environment variables (useful for Docker secrets or quick changes):
+
+| Variable | Description |
+|----------|-------------|
+| `PLEX_TOKEN` | Override Plex token |
+| `JELLYFIN_TOKEN` | Override Jellyfin token |
+| `DISCORD_WEBHOOK_URL` | Override Discord webhook URL |
+
+### CLI Flags
+
 ```bash
-docker-compose up -d
+python rescan.py --config /path/to/custom/config.ini
 ```
 
-### Manual Installation
+### Setting Reference
+
+**Plex / Jellyfin / Emby Settings**
+- `server` — Single server URL
+- `token` — API token for the server
+- `servers` — Multiple servers as `url:token` pairs (comma-separated)
+
+**Scan Settings**
+- `directories` — Comma-separated list of directories to scan
+- `scan_interval` — Seconds to wait between rescans
+- `run_interval` — Hours between full scans
+- `symlink_check` — Enable/disable broken symlink detection
+
+**Notification Settings**
+- `enabled` — Enable/disable Discord notifications
+- `discord_webhook_url` — Your Discord webhook URL
+
+## Discord Notifications
+
+When enabled, Rescan sends detailed notifications to Discord including:
+- Overview of missing items across all servers
+- Library-specific statistics
+- Broken symlinks (if enabled)
+- Errors and warnings
+
+## Manual Installation
 
 1. Clone the repository:
 ```bash
@@ -98,38 +185,13 @@ pip install -r requirements.txt
 3. Copy and configure the config file:
 ```bash
 cp config-example.ini config.ini
+# Edit config.ini with your settings
 ```
 
-4. Edit `config.ini` with your settings
-
-5. Run the script:
+4. Run the script:
 ```bash
 python rescan.py
 ```
-
-## Configuration
-
-### Plex Settings
-- `server`: Your Plex server URL (e.g., http://localhost:32400)
-- `token`: Your Plex authentication token
-
-### Scan Settings
-- `directories`: Comma-separated list of directories to scan
-- `scan_interval`: Seconds to wait between Plex rescans
-- `run_interval`: Hours between full scans
-- `symlink_check`: Enable/disable broken symlink detection
-
-### Notification Settings
-- `enabled`: Enable/disable Discord notifications
-- `discord_webhook_url`: Your Discord webhook URL
-
-## Discord Notifications
-
-The script sends detailed notifications to Discord including:
-- Overview of missing items
-- Library-specific statistics
-- Broken symlinks (if enabled)
-- Errors and warnings
 
 ## Contributing
 
@@ -146,4 +208,4 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 ## Acknowledgments
 
 - [PlexAPI](https://github.com/pkkid/python-plexapi) for Plex server interaction
-- [Discord.py](https://github.com/Rapptz/discord.py) for Discord webhook support 
+- [aiohttp](https://docs.aiohttp.org/) for async HTTP requests
