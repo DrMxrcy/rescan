@@ -1,4 +1,5 @@
 import argparse as _argparse
+import signal
 import os
 import requests
 import configparser
@@ -72,6 +73,17 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+# Graceful shutdown support
+_shutdown_requested = False
+
+def _handle_shutdown(signum, frame):
+    global _shutdown_requested
+    logger.info("[SHUTDOWN] Signal received — will exit after current operation completes")
+    _shutdown_requested = True
+
+signal.signal(signal.SIGTERM, _handle_shutdown)
+signal.signal(signal.SIGINT, _handle_shutdown)
 
 def _request_with_retry(method, url, retries=2, **kwargs):
     """Wrap requests calls with simple retry logic on transient errors."""
@@ -1084,6 +1096,9 @@ def run_scan():
     total_directories_searched = 0
 
     for SCAN_PATH in SCAN_PATHS:
+        if _shutdown_requested:
+            logger.info("[SHUTDOWN] Scan aborted cleanly")
+            break
         logger.info(f"--- Scanning: {SCAN_PATH} ---")
 
         if not os.path.isdir(SCAN_PATH):
@@ -1228,9 +1243,10 @@ def main():
     # Schedule subsequent runs (use _safe_run_scan so errors don't crash the loop)
     schedule.every(RUN_INTERVAL).hours.do(_safe_run_scan)
 
-    while True:
+    while not _shutdown_requested:
         schedule.run_pending()
         time.sleep(60)  # Check every minute for pending tasks
+    logger.info("[SHUTDOWN] Exiting cleanly")
 
 if __name__ == '__main__':
     # Check if config exists
