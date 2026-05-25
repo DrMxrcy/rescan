@@ -1,6 +1,7 @@
 import argparse as _argparse
 import signal
 import os
+import sys
 import requests
 import configparser
 import xml.etree.ElementTree as ET
@@ -23,9 +24,19 @@ _parser = _argparse.ArgumentParser(
 )
 _parser.add_argument("--config", default="config/config.ini", help="Path to config.ini")
 _args, _ = _parser.parse_known_args()
+CONFIG_PATH = _args.config
+
+if not os.path.exists(CONFIG_PATH):
+    logging.basicConfig(
+        level=logging.ERROR,
+        format="%(asctime)s %(levelname)-5s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    logging.getLogger(__name__).error("[FAIL] config file not found: %s", CONFIG_PATH)
+    sys.exit(1)
 
 config = configparser.ConfigParser()
-config.read(_args.config)
+config.read(CONFIG_PATH)
 
 try:
     LOG_LEVEL = config["logs"]["loglevel"]
@@ -35,8 +46,6 @@ try:
     NOTIFICATIONS_ENABLED = config.getboolean("notifications", "enabled", fallback=True)
     directories_raw = config["scan"]["directories"]
 except (KeyError, configparser.NoSectionError) as e:
-    import sys
-
     print(
         f"ERROR: Missing required config section/key: {e}. Please check your config.ini against config-example.ini."
     )
@@ -1476,9 +1485,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # Check if config exists
-    if not os.path.exists("config.ini"):
-        logger.error("[FAIL] config.ini not found")
-        exit(1)
-
     main()
