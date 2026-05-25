@@ -14,10 +14,15 @@ class ConfigPathStartupTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             scan_dir = tmp_path / "media"
+            library_dir = scan_dir / "TV"
+            outside_library_dir = scan_dir / "Anime_TV"
             config_dir = tmp_path / "config"
             stubs_dir = tmp_path / "stubs"
-            scan_dir.mkdir()
+            library_dir.mkdir(parents=True)
+            outside_library_dir.mkdir(parents=True)
             config_dir.mkdir()
+            (library_dir / "example.mkv").write_text("", encoding="utf-8")
+            (outside_library_dir / "outside.mkv").write_text("", encoding="utf-8")
             self._write_dependency_stubs(stubs_dir)
 
             (config_dir / "config.ini").write_text(
@@ -48,6 +53,7 @@ class ConfigPathStartupTest(unittest.TestCase):
 
             env = os.environ.copy()
             env["PYTHONPATH"] = str(stubs_dir)
+            env["TEST_LIBRARY_DIR"] = str(library_dir)
 
             result = subprocess.run(
                 [sys.executable, str(repo_root / "rescan.py")],
@@ -61,6 +67,15 @@ class ConfigPathStartupTest(unittest.TestCase):
         output = result.stdout + result.stderr
         self.assertEqual(result.returncode, 0, output)
         self.assertNotIn("[FAIL] config.ini not found", output)
+        self.assertIn(
+            "[CACHE] Jellyfin | Fetching indexed paths from http://jellyfin:8096",
+            output,
+        )
+        self.assertIn("[CACHE] Jellyfin | Cached 1 paths", output)
+        self.assertIn("[SKIP] Jellyfin | No matching library for:", output)
+        self.assertIn("outside.mkv", output)
+        self.assertNotIn("[MISS] Jellyfin | All Libraries | outside.mkv", output)
+        self.assertNotIn(f"[SCAN] Jellyfin | {outside_library_dir}", output)
 
     def _write_dependency_stubs(self, stubs_dir):
         (stubs_dir / "plexapi").mkdir(parents=True)
@@ -78,6 +93,9 @@ class ConfigPathStartupTest(unittest.TestCase):
         (stubs_dir / "requests.py").write_text(
             textwrap.dedent(
                 """
+                import os
+
+
                 class exceptions:
                     class ConnectionError(Exception):
                         pass
@@ -97,18 +115,41 @@ class ConfigPathStartupTest(unittest.TestCase):
                         return None
 
                     def json(self):
-                        return [
-                            {
-                                "ItemId": "library-1",
-                                "Name": "Movies",
-                                "Locations": [],
-                                "CollectionType": "movies",
+                        if self.url.endswith("/Library/VirtualFolders"):
+                            return [
+                                {
+                                    "ItemId": "library-1",
+                                    "Name": "Movies",
+                                    "Locations": [os.environ["TEST_LIBRARY_DIR"]],
+                                    "CollectionType": "movies",
+                                }
+                            ]
+
+                        if self.url.endswith("/Items"):
+                            return {
+                                "Items": [
+                                    {
+                                        "Path": os.path.join(
+                                            os.environ["TEST_LIBRARY_DIR"], "example.mkv"
+                                        ),
+                                        "MediaSources": [],
+                                    }
+                                ],
+                                "TotalRecordCount": 1,
                             }
-                        ]
+
+                        return {}
 
 
-                def get(*args, **kwargs):
-                    return Response()
+                def get(url, *args, **kwargs):
+                    params = kwargs.get("params") or {}
+                    if url.endswith("/Items"):
+                        limit = int(params.get("limit") or params.get("Limit") or 0)
+                        if limit > 1000:
+                            raise SystemExit("unbounded /Items request")
+                    response = Response()
+                    response.url = url
+                    return response
 
 
                 def post(*args, **kwargs):

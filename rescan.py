@@ -585,32 +585,70 @@ def get_libraries_emby(server_info):
 
 
 def _build_server_path_cache(server_info, server_label):
-    """Fetch ALL media item paths from a Jellyfin/Emby server in one API call.
+    """Fetch all media item paths from a Jellyfin/Emby server in pages.
 
     Returns a set of normalised absolute paths.
     Called once per scan cycle; result stored in _server_path_caches.
     """
     url = f"{server_info['url']}/Items"
     headers = {"X-Emby-Token": server_info["token"]}
-    params = {
-        "Recursive": "true",
-        "IncludeItemTypes": "Movie,Episode",
-        "Fields": "Path,MediaSources",
-        "Limit": 999999,
+    page_size = 500
+    base_params = {
+        "recursive": "true",
+        "includeItemTypes": "Movie,Episode",
+        "fields": "Path,MediaSources",
+        "enableTotalRecordCount": "true",
     }
     paths: set = set()
+    start_index = 0
+    total_record_count = None
+
+    logger.info(
+        f"[CACHE] {server_label} | Fetching indexed paths from {server_info['url']} "
+        f"in pages of {page_size}"
+    )
+
     try:
-        response = _request_with_retry(
-            requests.get, url, headers=headers, params=params, timeout=60
-        )
-        response.raise_for_status()
-        items = response.json().get("Items", [])
-        for item in items:
-            if "Path" in item:
-                paths.add(os.path.normpath(item["Path"]))
-            for ms in item.get("MediaSources", []):
-                if "Path" in ms:
-                    paths.add(os.path.normpath(ms["Path"]))
+        while True:
+            params = {
+                **base_params,
+                "startIndex": start_index,
+                "limit": page_size,
+            }
+            response = _request_with_retry(
+                requests.get, url, headers=headers, params=params, timeout=60
+            )
+            response.raise_for_status()
+            data = response.json()
+            if isinstance(data, list):
+                items = data
+                total_record_count = len(items)
+            else:
+                items = data.get("Items", [])
+                if total_record_count is None:
+                    total_record_count = data.get("TotalRecordCount")
+
+            for item in items:
+                if "Path" in item:
+                    paths.add(os.path.normpath(item["Path"]))
+                for ms in item.get("MediaSources", []):
+                    if "Path" in ms:
+                        paths.add(os.path.normpath(ms["Path"]))
+
+            page_count = len(items)
+            start_index += page_count
+            if total_record_count:
+                logger.info(
+                    f"[CACHE] {server_label} | Loaded {start_index:,}/{total_record_count:,} items"
+                )
+
+            if page_count == 0:
+                break
+            if total_record_count is not None and start_index >= total_record_count:
+                break
+            if page_count < page_size:
+                break
+
         logger.info(
             f"[CACHE] {server_label} | Cached {len(paths):,} paths from {server_info['url']}"
         )
@@ -963,6 +1001,34 @@ def check_file_emby(file_path, library_info, server_info):
     return os.path.normpath(file_path) in _server_path_caches[server_url]
 
 
+def _is_path_in_library(file_path, library_location):
+    normalized_file_path = os.path.normcase(os.path.normpath(file_path))
+    normalized_location = os.path.normcase(os.path.normpath(library_location))
+    try:
+        return (
+            os.path.commonpath([normalized_file_path, normalized_location])
+            == normalized_location
+        )
+    except ValueError:
+        return False
+
+
+def _skip_unmatched_library_status(server_info, file_path):
+    server_type = server_info["type"]
+    server_url = server_info["url"]
+    logger.info(
+        f"[SKIP] {server_type.capitalize()} | No matching library for: {file_path}"
+    )
+    return {
+        "server_type": server_type,
+        "server_url": server_url,
+        "found": False,
+        "skipped": True,
+        "library_info": None,
+        "token": server_info["token"],
+    }
+
+
 def check_file_in_all_servers(file_path):
     """Check if a file exists in all media servers and return status for each server.
 
@@ -974,6 +1040,7 @@ def check_file_in_all_servers(file_path):
                     'server_type': str,
                     'server_url': str,
                     'found': bool,
+                    'skipped': bool,
                     'library_info': dict or None  # Library info if found, or best matching library if not found
                 },
                 ...
@@ -1015,9 +1082,12 @@ def check_file_in_all_servers(file_path):
                 # Find best matching library based on path
                 for lib in libraries:
                     for location in lib.get("locations", []):
-                        normalized_location = os.path.normpath(location)
-                        if normalized_file_path.startswith(normalized_location):
-                            if len(normalized_location) > best_match_length:
+                        if _is_path_in_library(normalized_file_path, location):
+                            normalized_location = os.path.normpath(location)
+                            normalized_location_key = os.path.normcase(
+                                normalized_location
+                            )
+                            if len(normalized_location_key) > best_match_length:
                                 best_match = {
                                     "section_id": lib["key"],
                                     "section_title": lib["title"],
@@ -1025,20 +1095,15 @@ def check_file_in_all_servers(file_path):
                                     "token": server_info["token"],
                                     "server_type": server_type,
                                 }
-                                best_match_length = len(normalized_location)
+                                best_match_length = len(normalized_location_key)
 
-                # Use best match or first library as fallback
                 if best_match:
                     library_info_for_scan = best_match
-                elif libraries:
-                    first_lib = libraries[0]
-                    library_info_for_scan = {
-                        "section_id": first_lib["key"],
-                        "section_title": first_lib["title"],
-                        "server_url": server_url,
-                        "token": server_info["token"],
-                        "server_type": server_type,
-                    }
+                else:
+                    server_status_list.append(
+                        _skip_unmatched_library_status(server_info, file_path)
+                    )
+                    continue
 
                 # Check the best matching library first
                 if library_info_for_scan:
@@ -1081,9 +1146,12 @@ def check_file_in_all_servers(file_path):
                 best_match_length = 0
                 for lib in libraries:
                     for location in lib.get("locations", []):
-                        normalized_location = os.path.normpath(location)
-                        if normalized_file_path.startswith(normalized_location):
-                            if len(normalized_location) > best_match_length:
+                        if _is_path_in_library(normalized_file_path, location):
+                            normalized_location = os.path.normpath(location)
+                            normalized_location_key = os.path.normcase(
+                                normalized_location
+                            )
+                            if len(normalized_location_key) > best_match_length:
                                 best_match = {
                                     "section_id": lib["key"],
                                     "section_title": lib["title"],
@@ -1091,16 +1159,15 @@ def check_file_in_all_servers(file_path):
                                     "token": server_info["token"],
                                     "server_type": server_type,
                                 }
-                                best_match_length = len(normalized_location)
+                                best_match_length = len(normalized_location_key)
 
-                # Use best match or create default library_info
-                library_info = best_match or {
-                    "section_id": "",
-                    "section_title": "All Libraries",
-                    "server_url": server_url,
-                    "token": server_info["token"],
-                    "server_type": server_type,
-                }
+                if not best_match:
+                    server_status_list.append(
+                        _skip_unmatched_library_status(server_info, file_path)
+                    )
+                    continue
+
+                library_info = best_match
 
                 filename = os.path.basename(file_path)
                 library_name = library_info.get("section_title", "All Libraries")
@@ -1136,6 +1203,7 @@ def check_file_in_all_servers(file_path):
                     "server_type": server_type,
                     "server_url": server_url,
                     "found": found_on_this_server,
+                    "skipped": False,
                     "library_info": library_info_for_scan,
                     "token": server_info["token"],
                 }
@@ -1151,6 +1219,7 @@ def check_file_in_all_servers(file_path):
                     "server_type": server_type,
                     "server_url": server_url,
                     "found": False,
+                    "skipped": False,
                     "library_info": None,
                     "token": server_info["token"],
                 }
@@ -1164,7 +1233,8 @@ def check_file_in_all_servers(file_path):
         directory_cache.clear()
     directory_cache[cache_key] = result
 
-    if not found_anywhere:
+    searchable_statuses = [s for s in server_status_list if not s.get("skipped")]
+    if not found_anywhere and searchable_statuses:
         filename = os.path.basename(file_path)
         logger.info(f"[MISS] Not indexed on any server: {filename}")
 
@@ -1361,7 +1431,12 @@ def run_scan():
 
                 # Check if file is missing from any server
                 missing_servers = [
-                    s for s in file_status["server_status"] if not s["found"]
+                    s
+                    for s in file_status["server_status"]
+                    if not s["found"] and not s.get("skipped")
+                ]
+                skipped_servers = [
+                    s for s in file_status["server_status"] if s.get("skipped")
                 ]
 
                 if missing_servers:
@@ -1414,6 +1489,8 @@ def run_scan():
                                     warning_msg = f"[WARN] Could not determine library for {filename} on {server_status['server_type']}"
                                     logger.warning(warning_msg)
                                     stats.add_warning(warning_msg)
+                elif skipped_servers:
+                    logger.debug(f"[SKIP] No matching library on all servers: {filename}")
                 else:
                     logger.debug(f"[OK] Exists on all servers: {filename}")
 
