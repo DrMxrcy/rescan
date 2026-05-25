@@ -1,5 +1,5 @@
 <div align="center">
-  <a href="https://github.com/Pukabyte/rescan">
+  <a href="https://github.com/DrMxrcy/rescan">
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="assets/logo.png" width="400">
       <img alt="rescan" src="assets/logo.png" width="400">
@@ -8,14 +8,14 @@
 </div>
 
 <div align="center">
-  <a href="https://github.com/Pukabyte/rescan/stargazers"><img alt="GitHub Repo stars" src="https://img.shields.io/github/stars/Pukabyte/rescan?label=Rescan"></a>
-  <a href="https://github.com/Pukabyte/rescan/issues"><img alt="Issues" src="https://img.shields.io/github/issues/Pukabyte/rescan" /></a>
-  <a href="https://github.com/Pukabyte/rescan/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/Pukabyte/rescan"></a>
-  <a href="https://github.com/Pukabyte/rescan/graphs/contributors"><img alt="Contributors" src="https://img.shields.io/github/contributors/Pukabyte/rescan" /></a>
+  <a href="https://github.com/DrMxrcy/rescan/stargazers"><img alt="GitHub Repo stars" src="https://img.shields.io/github/stars/DrMxrcy/rescan?label=Rescan"></a>
+  <a href="https://github.com/DrMxrcy/rescan/issues"><img alt="Issues" src="https://img.shields.io/github/issues/DrMxrcy/rescan" /></a>
+  <a href="https://github.com/DrMxrcy/rescan/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/DrMxrcy/rescan"></a>
+  <a href="https://github.com/DrMxrcy/rescan/graphs/contributors"><img alt="Contributors" src="https://img.shields.io/github/contributors/DrMxrcy/rescan" /></a>
   <a href="https://discord.gg/vMSnNcd7m5"><img alt="Discord" src="https://img.shields.io/badge/Join%20discord-8A2BE2" /></a>
   <br/>
-  <a href="https://github.com/Pukabyte/rescan/actions"><img alt="Docker Build" src="https://img.shields.io/github/actions/workflow/status/Pukabyte/rescan/docker-build.yml?label=docker%20build" /></a>
-  <a href="https://github.com/Pukabyte/rescan/actions"><img alt="Lint" src="https://img.shields.io/github/actions/workflow/status/Pukabyte/rescan/lint.yml?label=lint" /></a>
+  <a href="https://github.com/DrMxrcy/rescan/actions"><img alt="Docker Build" src="https://img.shields.io/github/actions/workflow/status/DrMxrcy/rescan/docker.yml?label=docker%20build" /></a>
+  <a href="https://github.com/DrMxrcy/rescan/actions"><img alt="Lint" src="https://img.shields.io/github/actions/workflow/status/DrMxrcy/rescan/lint.yml?label=lint" /></a>
 </div>
 
 <div align="center">
@@ -60,7 +60,7 @@ mkdir -p /opt/rescan
 
 2. Download the example config:
 ```bash
-curl -o /opt/rescan/config.ini https://raw.githubusercontent.com/Pukabyte/rescan/main/config-example.ini
+curl -o /opt/rescan/config.ini https://raw.githubusercontent.com/DrMxrcy/rescan/main/config-example.ini
 ```
 
 3. Edit `/opt/rescan/config.ini` with your settings (see [Configuration](#configuration)).
@@ -173,7 +173,7 @@ When enabled, Rescan sends detailed notifications to Discord including:
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/Pukabyte/rescan.git
+git clone https://github.com/DrMxrcy/rescan.git
 cd rescan
 ```
 
@@ -207,5 +207,6 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## Acknowledgments
 
+- [Pukabyte](https://github.com/Pukabyte) — original author of Rescan
 - [PlexAPI](https://github.com/pkkid/python-plexapi) for Plex server interaction
 - [aiohttp](https://docs.aiohttp.org/) for async HTTP requests
