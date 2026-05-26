@@ -136,9 +136,11 @@ class ConfigPathStartupTest(unittest.TestCase):
         output = result.stdout + result.stderr
         self.assertEqual(result.returncode, 0, output)
         self.assertIn("[WORKERS] Scanning 2 libraries with 2 workers", output)
+        self.assertNotIn("[WARN] Cache failed for", output)
         self.assertIn(f"[QUEUE] Jellyfin | {tv_dir}", output)
         self.assertIn(f"[QUEUE] Jellyfin | {movie_dir}", output)
         self.assertIn(" Rescans queued:      2", output)
+        self.assertIn(" Missing files:       2", output)
 
     def test_metadata_repair_refreshes_indexed_item_with_missing_metadata(self):
         repo_root = Path(__file__).resolve().parents[1]
@@ -359,11 +361,12 @@ class ConfigPathStartupTest(unittest.TestCase):
                             if indexed_paths:
                                 paths = indexed_paths.split(os.pathsep)
                             else:
-                                paths = [
-                                    os.path.join(
-                                        os.environ["TEST_LIBRARY_DIR"], "example.mkv"
-                                    )
-                                ]
+                                library_dir = os.environ.get("TEST_LIBRARY_DIR")
+                                paths = (
+                                    [os.path.join(library_dir, "example.mkv")]
+                                    if library_dir
+                                    else []
+                                )
 
                             metadata_missing_path = os.environ.get(
                                 "TEST_METADATA_MISSING_PATH"

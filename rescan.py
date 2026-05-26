@@ -56,6 +56,7 @@ try:
     METADATA_REPAIR_ENABLED = config.getboolean(
         "behaviour", "metadata_repair", fallback=False
     )
+    CACHE_TIMEOUT = config.getint("behaviour", "cache_timeout_seconds", fallback=300)
     directories_raw = config["scan"]["directories"]
 except (KeyError, configparser.NoSectionError) as e:
     print(
@@ -117,6 +118,7 @@ _library_cache = {}
 # Bulk path cache for Jellyfin/Emby (built once per scan cycle)
 _server_path_caches: dict = {}  # {server_url: set of normalized file paths}
 _server_item_caches: dict = {}  # {server_url: {normalized_path: item}}
+_failed_cache_servers: set = set()  # server URLs whose cache build failed this cycle
 
 # ANSI escape codes for text formatting
 BOLD = "\033[1m"
@@ -640,7 +642,7 @@ def _build_server_path_cache(server_info, server_label):
                 "limit": page_size,
             }
             response = _request_with_retry(
-                requests.get, url, headers=headers, params=params, timeout=60
+                requests.get, url, headers=headers, params=params, timeout=CACHE_TIMEOUT
             )
             response.raise_for_status()
             data = response.json()
@@ -682,6 +684,7 @@ def _build_server_path_cache(server_info, server_label):
         )
     except Exception as e:
         logger.error(f"[FAIL] {server_label} | Could not build path cache: {e}")
+        _failed_cache_servers.add(server_info["url"])
     _server_item_caches[server_info["url"]] = items_by_path
     return paths
 
@@ -1267,6 +1270,12 @@ def check_file_in_all_servers(file_path):
                     )
                     continue
 
+                if server_url in _failed_cache_servers:
+                    server_status_list.append(
+                        _skip_unmatched_library_status(server_info, file_path)
+                    )
+                    continue
+
                 library_info = best_match
 
                 filename = os.path.basename(file_path)
@@ -1769,6 +1778,7 @@ def run_scan():
         directory_cache.clear()
     _server_path_caches.clear()
     _server_item_caches.clear()
+    _failed_cache_servers.clear()
     logger.info("--- SCAN CYCLE START ---")
 
     library_ids = get_library_ids()
@@ -1800,6 +1810,10 @@ def run_scan():
             _server_path_caches[server_info["url"]] = _build_server_path_cache(
                 server_info, "Emby"
             )
+    for url in _failed_cache_servers:
+        logger.warning(
+            f"[WARN] Cache failed for {url} — files will not be checked against this server this cycle"
+        )
     pending_scans = {}
     pending_metadata_refreshes = {}
     pruned_directories = 0
