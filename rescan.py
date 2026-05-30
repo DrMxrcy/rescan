@@ -56,7 +56,7 @@ try:
     METADATA_REPAIR_ENABLED = config.getboolean(
         "behaviour", "metadata_repair", fallback=False
     )
-    CACHE_TIMEOUT = config.getint("behaviour", "cache_timeout_seconds", fallback=300)
+    CACHE_TIMEOUT = config.getint("behaviour", "cache_timeout_seconds", fallback=60)
     CACHE_RETRY_WAIT = config.getint(
         "behaviour", "cache_retry_wait_seconds", fallback=60
     )
@@ -668,7 +668,12 @@ def _build_server_path_cache(server_info, server_label):
     base_params = {
         "recursive": "true",
         "includeItemTypes": "Movie,Episode",
-        "fields": "Path,MediaSources,ProviderIds,PremiereDate,ProductionYear",
+        "fields": "Path,MediaSources"
+        + (
+            ",ProviderIds,PremiereDate,ProductionYear"
+            if METADATA_REPAIR_ENABLED
+            else ""
+        ),
         "enableTotalRecordCount": "true",
     }
     paths: set = set()
