@@ -1537,7 +1537,7 @@ def scan_folder_jellyfin_emby(library_id, folder_paths, server_url, token, serve
 
     if isinstance(folder_paths, str):
         folder_paths = [folder_paths]
-    payload = {"Updates": [{"Path": p, "UpdateType": "Modified"} for p in folder_paths]}
+    payload = {"Updates": [{"Path": p, "UpdateType": "Created"} for p in folder_paths]}
 
     scan_start = time.time()
     try:
