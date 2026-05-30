@@ -58,6 +58,7 @@ try:
     )
     CACHE_TIMEOUT = config.getint("behaviour", "cache_timeout_seconds", fallback=300)
     CACHE_RETRY_WAIT = config.getint("behaviour", "cache_retry_wait_seconds", fallback=60)
+    CACHE_RETRY_ATTEMPTS = config.getint("behaviour", "cache_retry_attempts", fallback=3)
     directories_raw = config["scan"]["directories"]
 except (KeyError, configparser.NoSectionError) as e:
     print(
@@ -1811,10 +1812,12 @@ def run_scan():
             _server_path_caches[server_info["url"]] = _build_server_path_cache(
                 server_info, "Emby"
             )
-    if _failed_cache_servers:
+    for attempt in range(1, CACHE_RETRY_ATTEMPTS + 1):
+        if not _failed_cache_servers:
+            break
         logger.warning(
             f"[WARN] Cache failed for {len(_failed_cache_servers)} server(s) — "
-            f"retrying in {CACHE_RETRY_WAIT}s"
+            f"retry {attempt}/{CACHE_RETRY_ATTEMPTS} in {CACHE_RETRY_WAIT}s"
         )
         time.sleep(CACHE_RETRY_WAIT)
         retry_servers = list(_failed_cache_servers)
@@ -1823,14 +1826,20 @@ def run_scan():
             if server_info["url"] not in retry_servers:
                 continue
             label = server_info["type"].capitalize()
-            logger.info(f"[CACHE] {label} | Retrying path cache for {server_info['url']}")
+            logger.info(
+                f"[CACHE] {label} | Retrying path cache for {server_info['url']} "
+                f"(attempt {attempt}/{CACHE_RETRY_ATTEMPTS})"
+            )
             _server_path_caches[server_info["url"]] = _build_server_path_cache(
                 server_info, label
             )
-        for url in _failed_cache_servers:
-            error_msg = f"Cache failed for {url} after retry — files will not be checked against this server this cycle"
-            logger.warning(f"[WARN] {error_msg}")
-            stats.add_error(error_msg)
+    for url in _failed_cache_servers:
+        error_msg = (
+            f"Cache failed for {url} after {CACHE_RETRY_ATTEMPTS} retries — "
+            f"files will not be checked against this server this cycle"
+        )
+        logger.warning(f"[WARN] {error_msg}")
+        stats.add_error(error_msg)
     pending_scans = {}
     pending_metadata_refreshes = {}
     pruned_directories = 0
