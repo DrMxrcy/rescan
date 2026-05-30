@@ -1651,14 +1651,14 @@ def process_pending_scans(pending_scans):
     for r in jf_scans:
         by_server[(r["server_url"], r["server_type"], r["token"])].append(r)
 
-    for (server_url, server_type, token), requests in by_server.items():
+    for (server_url, server_type, token), scan_requests in by_server.items():
         server_name = server_type.capitalize()
-        total_batches = (len(requests) + BATCH_SIZE - 1) // BATCH_SIZE
-        for batch_num, i in enumerate(range(0, len(requests), BATCH_SIZE), start=1):
+        total_batches = (len(scan_requests) + BATCH_SIZE - 1) // BATCH_SIZE
+        for batch_num, i in enumerate(range(0, len(scan_requests), BATCH_SIZE), start=1):
             if _shutdown_requested:
                 logger.info("[SHUTDOWN] Pending scans aborted cleanly")
                 return processed, batches_sent
-            chunk = requests[i: i + BATCH_SIZE]
+            chunk = scan_requests[i: i + BATCH_SIZE]
             folder_paths = [r["folder_path"] for r in chunk]
             logger.info(
                 f"[BATCH] {server_name} | {len(folder_paths)} folders "
