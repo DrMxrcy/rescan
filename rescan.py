@@ -658,6 +658,46 @@ def _ping_server(server_info):
         return False
 
 
+def _diagnose_stuck_page(
+    url, headers, base_params, start_index, page_size, server_label
+):
+    """Binary-search a stuck page range to find the first item that causes a hang."""
+    logger.info(
+        f"[CACHE] {server_label} | Diagnosing stuck range {start_index:,}–{start_index + page_size - 1:,} ..."
+    )
+    lo, hi = start_index, start_index + page_size - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        try:
+            r = requests.get(
+                url,
+                headers=headers,
+                params={**base_params, "startIndex": mid, "limit": 1},
+                timeout=CACHE_TIMEOUT,
+            )
+            r.raise_for_status()
+            items = (
+                r.json().get("Items", []) if isinstance(r.json(), dict) else r.json()
+            )
+            if items:
+                item = items[0]
+                logger.debug(
+                    f"[CACHE] {server_label} | offset {mid:,} ok — "
+                    f"Id={item.get('Id')} Path={item.get('Path')}"
+                )
+            lo = mid + 1
+        except Exception:
+            logger.warning(
+                f"[CACHE] {server_label} | Stuck item at offset {mid:,} — "
+                f"check Jellyfin item near this position (Id unknown, query timed out)"
+            )
+            hi = mid - 1
+
+    logger.info(
+        f"[CACHE] {server_label} | Diagnosis complete for range starting at {start_index:,}"
+    )
+
+
 def _build_server_path_cache(server_info, server_label):
     """Fetch all media item paths from a Jellyfin/Emby server in pages.
 
@@ -737,6 +777,9 @@ def _build_server_path_cache(server_info, server_label):
                     )
                     time.sleep(CACHE_RETRY_WAIT)
             if page_skipped:
+                _diagnose_stuck_page(
+                    url, headers, base_params, start_index, page_size, server_label
+                )
                 start_index += page_size
                 if total_record_count is not None and start_index >= total_record_count:
                     break
