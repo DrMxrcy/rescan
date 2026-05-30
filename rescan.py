@@ -66,6 +66,9 @@ try:
     CACHE_PAGE_MAX_RETRIES = config.getint(
         "behaviour", "cache_page_max_retries", fallback=5
     )
+    CACHE_FETCH_MEDIA_SOURCES = config.getboolean(
+        "behaviour", "cache_fetch_media_sources", fallback=False
+    )
     BATCH_SIZE = config.getint("behaviour", "batch_size", fallback=25)
     BATCH_DELAY = config.getint("behaviour", "batch_delay_seconds", fallback=10)
     CACHE_PAGE_SIZE = config.getint("behaviour", "cache_page_size", fallback=100)
@@ -711,7 +714,8 @@ def _build_server_path_cache(server_info, server_label):
     base_params = {
         "recursive": "true",
         "includeItemTypes": "Movie,Episode",
-        "fields": "Path,MediaSources"
+        "fields": "Path"
+        + (",MediaSources" if CACHE_FETCH_MEDIA_SOURCES else "")
         + (
             ",ProviderIds,PremiereDate,ProductionYear"
             if METADATA_REPAIR_ENABLED
