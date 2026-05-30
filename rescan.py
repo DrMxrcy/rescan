@@ -63,6 +63,9 @@ try:
     CACHE_RETRY_ATTEMPTS = config.getint(
         "behaviour", "cache_retry_attempts", fallback=0
     )
+    CACHE_PAGE_MAX_RETRIES = config.getint(
+        "behaviour", "cache_page_max_retries", fallback=5
+    )
     BATCH_SIZE = config.getint("behaviour", "batch_size", fallback=25)
     BATCH_DELAY = config.getint("behaviour", "batch_delay_seconds", fallback=10)
     CACHE_PAGE_SIZE = config.getint("behaviour", "cache_page_size", fallback=100)
@@ -694,6 +697,7 @@ def _build_server_path_cache(server_info, server_label):
                 "limit": page_size,
             }
             page_attempt = 0
+            page_skipped = False
             while True:
                 try:
                     response = _request_with_retry(
@@ -712,6 +716,16 @@ def _build_server_path_cache(server_info, server_label):
                     unlimited = CACHE_RETRY_ATTEMPTS == 0
                     if not unlimited and page_attempt >= CACHE_RETRY_ATTEMPTS:
                         raise
+                    if (
+                        CACHE_PAGE_MAX_RETRIES > 0
+                        and page_attempt >= CACHE_PAGE_MAX_RETRIES
+                    ):
+                        logger.warning(
+                            f"[CACHE] {server_label} | Page offset {start_index:,} skipped "
+                            f"after {page_attempt} attempts — {page_size} items will not be cached"
+                        )
+                        page_skipped = True
+                        break
                     attempt_label = (
                         f"{page_attempt}/∞"
                         if unlimited
@@ -722,6 +736,11 @@ def _build_server_path_cache(server_info, server_label):
                         f"(attempt {attempt_label}), retrying in {CACHE_RETRY_WAIT}s: {page_exc}"
                     )
                     time.sleep(CACHE_RETRY_WAIT)
+            if page_skipped:
+                start_index += page_size
+                if total_record_count is not None and start_index >= total_record_count:
+                    break
+                continue
             data = response.json()
             if isinstance(data, list):
                 items = data
