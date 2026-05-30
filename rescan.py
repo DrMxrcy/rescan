@@ -58,7 +58,9 @@ try:
     )
     CACHE_TIMEOUT = config.getint("behaviour", "cache_timeout_seconds", fallback=300)
     CACHE_RETRY_WAIT = config.getint("behaviour", "cache_retry_wait_seconds", fallback=60)
-    CACHE_RETRY_ATTEMPTS = config.getint("behaviour", "cache_retry_attempts", fallback=3)
+    CACHE_RETRY_ATTEMPTS = config.getint("behaviour", "cache_retry_attempts", fallback=0)
+    BATCH_SIZE = config.getint("behaviour", "batch_size", fallback=25)
+    BATCH_DELAY = config.getint("behaviour", "batch_delay_seconds", fallback=10)
     directories_raw = config["scan"]["directories"]
 except (KeyError, configparser.NoSectionError) as e:
     print(
@@ -429,6 +431,28 @@ class RunStats:
             logger.error(f"[FAIL] Discord notification failed: {str(e)}")
 
 
+async def _send_discord_alert(message, color=None):
+    """Send a single-line Discord notification without a full stats summary."""
+    if not DISCORD_WEBHOOK_URL:
+        return
+    try:
+        embed = Embed(
+            description=message,
+            color=color or Color.orange(),
+            timestamp=datetime.now(),
+        )
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            webhook = Webhook.from_url(DISCORD_WEBHOOK_URL, session=session)
+            await webhook.send(
+                embed=embed,
+                avatar_url=DISCORD_AVATAR_URL,
+                username=DISCORD_WEBHOOK_NAME,
+            )
+    except Exception as e:
+        logger.debug(f"[WARN] Discord alert failed: {e}")
+
+
 async def send_discord_webhook(webhook, embed):
     """Send a Discord webhook message."""
     try:
@@ -608,6 +632,22 @@ def get_libraries_emby(server_info):
     except Exception as e:
         logger.error(f"[FAIL] Emby | Could not fetch libraries: {str(e)}")
     return libraries
+
+
+def _ping_server(server_info):
+    """Quick reachability check before attempting an expensive cache build."""
+    server_type = server_info["type"]
+    if server_type == "plex":
+        url = f"{server_info['url']}/identity"
+        headers = {"X-Plex-Token": server_info["token"]}
+    else:
+        url = f"{server_info['url']}/System/Info"
+        headers = {"X-Emby-Token": server_info["token"]}
+    try:
+        response = requests.get(url, headers=headers, timeout=5)
+        return response.status_code < 500
+    except Exception:
+        return False
 
 
 def _build_server_path_cache(server_info, server_label):
@@ -1171,10 +1211,8 @@ def check_file_in_all_servers(file_path):
         metadata_refresh = None
 
         try:
-            # Small delay to be respectful to API
-            time.sleep(0.05)
-
             if server_type == "plex":
+                time.sleep(0.05)  # rate-limit Plex API calls
                 # Plex requires checking each library individually
                 # First, find the best matching library based on path
                 libraries = _library_cache.get(server_url) or get_libraries_plex(
@@ -1391,12 +1429,14 @@ def scan_folder_plex(library_id, folder_path, server_url, token):
         logger.error(f"[FAIL] Plex | Scan failed: {str(e)} ({scan_duration:.2f}s)")
 
 
-def scan_folder_jellyfin_emby(library_id, folder_path, server_url, token, server_type):
-    """Trigger a folder-specific scan on a Jellyfin or Emby server using the Media/Updated endpoint."""
+def scan_folder_jellyfin_emby(library_id, folder_paths, server_url, token, server_type):
+    """Trigger folder scans on a Jellyfin or Emby server using the Media/Updated endpoint."""
     url = f"{server_url}/Library/Media/Updated"
     headers = {"X-Emby-Token": token, "Content-Type": "application/json"}
 
-    payload = {"Updates": [{"Path": folder_path, "UpdateType": "Modified"}]}
+    if isinstance(folder_paths, str):
+        folder_paths = [folder_paths]
+    payload = {"Updates": [{"Path": p, "UpdateType": "Modified"} for p in folder_paths]}
 
     scan_start = time.time()
     try:
@@ -1581,12 +1621,16 @@ def _queue_scan_request(pending_scans, server_status, parent_folder, file_path=N
 
 def process_pending_scans(pending_scans):
     processed = 0
+    batches_sent = 0
 
-    for scan_request in pending_scans.values():
+    plex_scans = [r for r in pending_scans.values() if r["server_type"] == "plex"]
+    jf_scans = [r for r in pending_scans.values() if r["server_type"] in ["jellyfin", "emby"]]
+
+    # Plex: one folder at a time with SCAN_INTERVAL (unchanged)
+    for scan_request in plex_scans:
         if _shutdown_requested:
             logger.info("[SHUTDOWN] Pending scans aborted cleanly")
-            break
-
+            return processed, batches_sent
         server_name = scan_request["server_type"].capitalize()
         logger.info(f"[SCAN] {server_name} | {scan_request['folder_path']}")
         scan_folder(
@@ -1598,12 +1642,38 @@ def process_pending_scans(pending_scans):
         )
         state_cache.mark_scan_processed(scan_request)
         processed += 1
-
         if SCAN_INTERVAL > 0:
             logger.info(f"[WAIT] {SCAN_INTERVAL}s before next scan")
             time.sleep(SCAN_INTERVAL)
 
-    return processed
+    # Jellyfin/Emby: batch by server, chunk by BATCH_SIZE
+    by_server = defaultdict(list)
+    for r in jf_scans:
+        by_server[(r["server_url"], r["server_type"], r["token"])].append(r)
+
+    for (server_url, server_type, token), requests in by_server.items():
+        server_name = server_type.capitalize()
+        total_batches = (len(requests) + BATCH_SIZE - 1) // BATCH_SIZE
+        for batch_num, i in enumerate(range(0, len(requests), BATCH_SIZE), start=1):
+            if _shutdown_requested:
+                logger.info("[SHUTDOWN] Pending scans aborted cleanly")
+                return processed, batches_sent
+            chunk = requests[i: i + BATCH_SIZE]
+            folder_paths = [r["folder_path"] for r in chunk]
+            logger.info(
+                f"[BATCH] {server_name} | {len(folder_paths)} folders "
+                f"(batch {batch_num}/{total_batches}) -> {server_url}"
+            )
+            scan_folder_jellyfin_emby("", folder_paths, server_url, token, server_type)
+            for r in chunk:
+                state_cache.mark_scan_processed(r)
+            processed += len(chunk)
+            batches_sent += 1
+            if batch_num < total_batches and BATCH_DELAY > 0:
+                logger.info(f"[WAIT] {BATCH_DELAY}s before next batch")
+                time.sleep(BATCH_DELAY)
+
+    return processed, batches_sent
 
 
 def is_broken_symlink(file_path):
@@ -1804,22 +1874,31 @@ def run_scan():
     logger.info(f"Found {len(library_ids)} libraries across {server_summary}")
     library_roots = _get_library_roots()
     for server_info in media_servers:
-        if server_info["type"] == "jellyfin":
-            _server_path_caches[server_info["url"]] = _build_server_path_cache(
-                server_info, "Jellyfin"
+        if server_info["type"] not in ["jellyfin", "emby"]:
+            continue
+        label = server_info["type"].capitalize()
+        if not _ping_server(server_info):
+            logger.warning(
+                f"[WARN] {label} | Server not reachable at {server_info['url']} — skipping cache build"
             )
-        elif server_info["type"] == "emby":
+            _failed_cache_servers.add(server_info["url"])
+        else:
             _server_path_caches[server_info["url"]] = _build_server_path_cache(
-                server_info, "Emby"
+                server_info, label
             )
-    for attempt in range(1, CACHE_RETRY_ATTEMPTS + 1):
-        if not _failed_cache_servers:
+    attempt = 0
+    limit_label = str(CACHE_RETRY_ATTEMPTS) if CACHE_RETRY_ATTEMPTS > 0 else "∞"
+    while _failed_cache_servers and not _shutdown_requested:
+        if CACHE_RETRY_ATTEMPTS > 0 and attempt >= CACHE_RETRY_ATTEMPTS:
             break
+        attempt += 1
         logger.warning(
             f"[WARN] Cache failed for {len(_failed_cache_servers)} server(s) — "
-            f"retry {attempt}/{CACHE_RETRY_ATTEMPTS} in {CACHE_RETRY_WAIT}s"
+            f"retry {attempt}/{limit_label} in {CACHE_RETRY_WAIT}s"
         )
         time.sleep(CACHE_RETRY_WAIT)
+        if _shutdown_requested:
+            break
         retry_servers = list(_failed_cache_servers)
         _failed_cache_servers.clear()
         for server_info in media_servers:
@@ -1828,14 +1907,26 @@ def run_scan():
             label = server_info["type"].capitalize()
             logger.info(
                 f"[CACHE] {label} | Retrying path cache for {server_info['url']} "
-                f"(attempt {attempt}/{CACHE_RETRY_ATTEMPTS})"
+                f"(attempt {attempt}/{limit_label})"
             )
-            _server_path_caches[server_info["url"]] = _build_server_path_cache(
-                server_info, label
-            )
+            if not _ping_server(server_info):
+                logger.warning(
+                    f"[WARN] {label} | Still not reachable at {server_info['url']}"
+                )
+                _failed_cache_servers.add(server_info["url"])
+            else:
+                _server_path_caches[server_info["url"]] = _build_server_path_cache(
+                    server_info, label
+                )
+        recovered = [u for u in retry_servers if u not in _failed_cache_servers]
+        for url in recovered:
+            msg = f"Cache recovered for {url} after {attempt} {'retry' if attempt == 1 else 'retries'} — scan proceeding"
+            logger.info(f"[OK] {msg}")
+            asyncio.run(_send_discord_alert(msg, color=Color.green()))
     for url in _failed_cache_servers:
+        retry_label = f"after {attempt} retries" if attempt else "on first attempt"
         error_msg = (
-            f"Cache failed for {url} after {CACHE_RETRY_ATTEMPTS} retries — "
+            f"Cache failed for {url} {retry_label} — "
             f"files will not be checked against this server this cycle"
         )
         logger.warning(f"[WARN] {error_msg}")
@@ -1963,7 +2054,7 @@ def run_scan():
             f"{directories_in_path} directories"
         )
 
-    processed_scans = process_pending_scans(pending_scans)
+    processed_scans, batches_sent = process_pending_scans(pending_scans)
     processed_metadata_refreshes = process_pending_metadata_refreshes(
         pending_metadata_refreshes
     )
@@ -1972,7 +2063,8 @@ def run_scan():
     logger.info(f" Files checked:       {total_files_found}")
     logger.info(f" Directories:         {total_directories_searched}")
     logger.info(f" Rescans queued:      {len(pending_scans)}")
-    logger.info(f" Rescans processed:   {processed_scans}")
+    batches_str = f" ({batches_sent} batches)" if batches_sent else ""
+    logger.info(f" Rescans processed:   {processed_scans}{batches_str}")
     logger.info(f" Metadata queued:     {len(pending_metadata_refreshes)}")
     logger.info(f" Metadata processed:  {processed_metadata_refreshes}")
     logger.info(f" Pruned directories:  {pruned_directories}")
@@ -2029,7 +2121,8 @@ def main():
 
     while not _shutdown_requested:
         schedule.run_pending()
-        time.sleep(60)  # Check every minute for pending tasks
+        idle = schedule.idle_seconds()
+        time.sleep(min(max(1, idle), 60) if idle is not None else 60)
     logger.info("[SHUTDOWN] Exiting cleanly")
 
 

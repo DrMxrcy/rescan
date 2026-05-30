@@ -74,12 +74,12 @@ class ConfigPathStartupTest(unittest.TestCase):
         self.assertNotIn("[MISS] Not indexed on any server:", output)
         self.assertNotIn("outside-0.mkv", output)
         self.assertNotIn("[MISS] Jellyfin | All Libraries | outside-0.mkv", output)
-        self.assertNotIn(f"[SCAN] Jellyfin | {outside_library_dir}", output)
+        self.assertNotIn(str(outside_library_dir), output.split("[BATCH]")[-1] if "[BATCH]" in output else "")
         self.assertIn(f"[QUEUE] Jellyfin | {library_dir}", output)
-        self.assertIn(f"[SCAN] Jellyfin | {library_dir}", output)
+        self.assertIn("[BATCH] Jellyfin |", output)
         self.assertLess(
             output.index(f"[DONE] {scan_dir}"),
-            output.index(f"[SCAN] Jellyfin | {library_dir}"),
+            output.index("[BATCH] Jellyfin |"),
         )
         self.assertIn(" Rescans queued:      1", output)
 
@@ -204,7 +204,7 @@ class ConfigPathStartupTest(unittest.TestCase):
         self.assertIn("[QUEUE] Metadata refreshes: 1", output)
         self.assertIn("[REFRESH] Jellyfin | Metadata | needs-meta.mkv", output)
         self.assertIn(" Metadata queued:     1", output)
-        self.assertNotIn("[SCAN] Jellyfin |", output)
+        self.assertNotIn("[BATCH] Jellyfin |", output)
         self.assertEqual(
             post_lines,
             ["http://jellyfin:8096/Items/metadata-missing-item/Refresh"],
@@ -279,12 +279,12 @@ class ConfigPathStartupTest(unittest.TestCase):
         self.assertEqual(second_result.returncode, 0, second_output)
         self.assertEqual(third_result.returncode, 0, third_output)
         self.assertIn(f"[QUEUE] Jellyfin | {library_dir}", first_output)
-        self.assertIn(f"[SCAN] Jellyfin | {library_dir}", first_output)
+        self.assertIn("[BATCH] Jellyfin |", first_output)
         self.assertNotIn(f"[QUEUE] Jellyfin | {library_dir}", second_output)
-        self.assertNotIn(f"[SCAN] Jellyfin | {library_dir}", second_output)
+        self.assertNotIn("[BATCH] Jellyfin |", second_output)
         self.assertIn(" Repair cooldown skips: 1", second_output)
         self.assertIn(f"[QUEUE] Jellyfin | {library_dir}", third_output)
-        self.assertIn(f"[SCAN] Jellyfin | {library_dir}", third_output)
+        self.assertIn("[BATCH] Jellyfin |", third_output)
         self.assertEqual(
             post_lines,
             [
