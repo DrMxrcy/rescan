@@ -57,8 +57,12 @@ try:
         "behaviour", "metadata_repair", fallback=False
     )
     CACHE_TIMEOUT = config.getint("behaviour", "cache_timeout_seconds", fallback=300)
-    CACHE_RETRY_WAIT = config.getint("behaviour", "cache_retry_wait_seconds", fallback=60)
-    CACHE_RETRY_ATTEMPTS = config.getint("behaviour", "cache_retry_attempts", fallback=0)
+    CACHE_RETRY_WAIT = config.getint(
+        "behaviour", "cache_retry_wait_seconds", fallback=60
+    )
+    CACHE_RETRY_ATTEMPTS = config.getint(
+        "behaviour", "cache_retry_attempts", fallback=0
+    )
     BATCH_SIZE = config.getint("behaviour", "batch_size", fallback=25)
     BATCH_DELAY = config.getint("behaviour", "batch_delay_seconds", fallback=10)
     directories_raw = config["scan"]["directories"]
@@ -1624,7 +1628,9 @@ def process_pending_scans(pending_scans):
     batches_sent = 0
 
     plex_scans = [r for r in pending_scans.values() if r["server_type"] == "plex"]
-    jf_scans = [r for r in pending_scans.values() if r["server_type"] in ["jellyfin", "emby"]]
+    jf_scans = [
+        r for r in pending_scans.values() if r["server_type"] in ["jellyfin", "emby"]
+    ]
 
     # Plex: one folder at a time with SCAN_INTERVAL (unchanged)
     for scan_request in plex_scans:
@@ -1654,11 +1660,13 @@ def process_pending_scans(pending_scans):
     for (server_url, server_type, token), scan_requests in by_server.items():
         server_name = server_type.capitalize()
         total_batches = (len(scan_requests) + BATCH_SIZE - 1) // BATCH_SIZE
-        for batch_num, i in enumerate(range(0, len(scan_requests), BATCH_SIZE), start=1):
+        for batch_num, i in enumerate(
+            range(0, len(scan_requests), BATCH_SIZE), start=1
+        ):
             if _shutdown_requested:
                 logger.info("[SHUTDOWN] Pending scans aborted cleanly")
                 return processed, batches_sent
-            chunk = scan_requests[i: i + BATCH_SIZE]
+            chunk = scan_requests[i : i + BATCH_SIZE]
             folder_paths = [r["folder_path"] for r in chunk]
             logger.info(
                 f"[BATCH] {server_name} | {len(folder_paths)} folders "

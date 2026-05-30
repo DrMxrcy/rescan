@@ -74,7 +74,10 @@ class ConfigPathStartupTest(unittest.TestCase):
         self.assertNotIn("[MISS] Not indexed on any server:", output)
         self.assertNotIn("outside-0.mkv", output)
         self.assertNotIn("[MISS] Jellyfin | All Libraries | outside-0.mkv", output)
-        self.assertNotIn(str(outside_library_dir), output.split("[BATCH]")[-1] if "[BATCH]" in output else "")
+        self.assertNotIn(
+            str(outside_library_dir),
+            output.split("[BATCH]")[-1] if "[BATCH]" in output else "",
+        )
         self.assertIn(f"[QUEUE] Jellyfin | {library_dir}", output)
         self.assertIn("[BATCH] Jellyfin |", output)
         self.assertLess(
