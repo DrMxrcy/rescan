@@ -1479,15 +1479,18 @@ def scan_folder_jellyfin_emby(library_id, folder_paths, server_url, token, serve
             logger.info(
                 f"[OK] {server_type.capitalize()} | Scan completed ({scan_duration:.2f}s)"
             )
+            return True
         else:
             logger.warning(
                 f"[WARN] {server_type.capitalize()} | Scan returned status {response.status_code} ({scan_duration:.2f}s)"
             )
+            return False
     except requests.exceptions.RequestException as e:
         scan_duration = time.time() - scan_start
         logger.error(
             f"[FAIL] {server_type.capitalize()} | Scan failed: {str(e)} ({scan_duration:.2f}s)"
         )
+        return False
 
 
 def scan_folder(library_id, folder_path, server_url, token, server_type):
@@ -1698,10 +1701,17 @@ def process_pending_scans(pending_scans):
                 f"[BATCH] {server_name} | {len(folder_paths)} folders "
                 f"(batch {batch_num}/{total_batches}) -> {server_url}"
             )
-            scan_folder_jellyfin_emby("", folder_paths, server_url, token, server_type)
-            for r in chunk:
-                state_cache.mark_scan_processed(r)
-            processed += len(chunk)
+            ok = scan_folder_jellyfin_emby(
+                "", folder_paths, server_url, token, server_type
+            )
+            if ok:
+                for r in chunk:
+                    state_cache.mark_scan_processed(r)
+                processed += len(chunk)
+            else:
+                logger.warning(
+                    f"[WARN] {server_name} | Batch {batch_num}/{total_batches} failed — will retry next cycle"
+                )
             batches_sent += 1
             if batch_num < total_batches and BATCH_DELAY > 0:
                 logger.info(f"[WAIT] {BATCH_DELAY}s before next batch")
@@ -1887,15 +1897,26 @@ def run_scan():
     _failed_cache_servers.clear()
     logger.info("--- SCAN CYCLE START ---")
 
-    library_ids = get_library_ids()
-
-    # Check if we have at least one library configured
-    if not library_ids:
-        error_msg = "Could not find any libraries in any media server."
-        logger.error(f"[FAIL] {error_msg}")
-        stats.add_error(error_msg)
-        asyncio.run(stats.send_discord_summary())
-        return
+    lib_attempt = 0
+    while True:
+        library_ids = get_library_ids()
+        if library_ids:
+            break
+        lib_attempt += 1
+        unlimited = CACHE_RETRY_ATTEMPTS == 0
+        if not unlimited and lib_attempt >= CACHE_RETRY_ATTEMPTS:
+            error_msg = "Could not find any libraries in any media server."
+            logger.error(f"[FAIL] {error_msg}")
+            stats.add_error(error_msg)
+            asyncio.run(stats.send_discord_summary())
+            return
+        attempt_label = (
+            f"{lib_attempt}/∞" if unlimited else f"{lib_attempt}/{CACHE_RETRY_ATTEMPTS}"
+        )
+        logger.warning(
+            f"[WARN] No libraries found (attempt {attempt_label}), retrying in {CACHE_RETRY_WAIT}s"
+        )
+        time.sleep(CACHE_RETRY_WAIT)
 
     server_counts = {}
     for server in media_servers:
