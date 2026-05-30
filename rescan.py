@@ -688,10 +688,35 @@ def _build_server_path_cache(server_info, server_label):
                 "startIndex": start_index,
                 "limit": page_size,
             }
-            response = _request_with_retry(
-                requests.get, url, headers=headers, params=params, timeout=CACHE_TIMEOUT
-            )
-            response.raise_for_status()
+            page_attempt = 0
+            while True:
+                try:
+                    response = _request_with_retry(
+                        requests.get,
+                        url,
+                        headers=headers,
+                        params=params,
+                        timeout=CACHE_TIMEOUT,
+                    )
+                    response.raise_for_status()
+                    break
+                except Exception as page_exc:
+                    if _shutdown_requested:
+                        raise
+                    page_attempt += 1
+                    unlimited = CACHE_RETRY_ATTEMPTS == 0
+                    if not unlimited and page_attempt >= CACHE_RETRY_ATTEMPTS:
+                        raise
+                    attempt_label = (
+                        f"{page_attempt}/∞"
+                        if unlimited
+                        else f"{page_attempt}/{CACHE_RETRY_ATTEMPTS}"
+                    )
+                    logger.warning(
+                        f"[CACHE] {server_label} | Page offset {start_index:,} failed "
+                        f"(attempt {attempt_label}), retrying in {CACHE_RETRY_WAIT}s: {page_exc}"
+                    )
+                    time.sleep(CACHE_RETRY_WAIT)
             data = response.json()
             if isinstance(data, list):
                 items = data
