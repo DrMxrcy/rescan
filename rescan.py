@@ -65,6 +65,7 @@ try:
     )
     BATCH_SIZE = config.getint("behaviour", "batch_size", fallback=25)
     BATCH_DELAY = config.getint("behaviour", "batch_delay_seconds", fallback=10)
+    CACHE_PAGE_SIZE = config.getint("behaviour", "cache_page_size", fallback=100)
     directories_raw = config["scan"]["directories"]
 except (KeyError, configparser.NoSectionError) as e:
     print(
@@ -663,7 +664,7 @@ def _build_server_path_cache(server_info, server_label):
     """
     url = f"{server_info['url']}/Items"
     headers = {"X-Emby-Token": server_info["token"]}
-    page_size = 500
+    page_size = CACHE_PAGE_SIZE
     base_params = {
         "recursive": "true",
         "includeItemTypes": "Movie,Episode",
