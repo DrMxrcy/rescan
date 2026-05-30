@@ -355,6 +355,11 @@ class RunStats:
         self.total_scanned = 0
         self.total_missing = 0
         self.broken_symlinks = 0
+        self.rescans_queued = 0
+        self.rescans_processed = 0
+        self.batches_sent = 0
+        self.metadata_queued = 0
+        self.metadata_processed = 0
 
     def add_missing_item(self, library_name, file_path):
         self.missing_items[library_name].append(file_path)
@@ -398,9 +403,40 @@ class RunStats:
                 # Add overview
                 embed.add_field(
                     name="📊 Overview",
-                    value=f"Found **{self.total_missing}** items from **{self.total_scanned}** scanned files",
+                    value=f"**{self.total_missing}** missing from **{self.total_scanned}** scanned files",
                     inline=False,
                 )
+
+                # Add rescan results if any scans were queued or processed
+                if self.rescans_queued or self.rescans_processed or self.metadata_queued:
+                    batches_str = (
+                        f" in **{self.batches_sent}** batches"
+                        if self.batches_sent > 1
+                        else ""
+                    )
+                    rescan_lines = []
+                    if self.rescans_processed:
+                        rescan_lines.append(
+                            f"Rescans sent: **{self.rescans_processed}** dirs{batches_str}"
+                        )
+                    elif self.rescans_queued:
+                        rescan_lines.append(
+                            f"Rescans queued: **{self.rescans_queued}** dirs (not yet sent)"
+                        )
+                    if self.metadata_processed:
+                        rescan_lines.append(
+                            f"Metadata refreshes: **{self.metadata_processed}**"
+                        )
+                    elif self.metadata_queued:
+                        rescan_lines.append(
+                            f"Metadata queued: **{self.metadata_queued}**"
+                        )
+                    if rescan_lines:
+                        embed.add_field(
+                            name="🔄 Actions",
+                            value="\n".join(rescan_lines),
+                            inline=False,
+                        )
 
                 # Add broken symlinks summary if any
                 if self.broken_symlinks > 0:
@@ -414,7 +450,7 @@ class RunStats:
                 for library, items in self.missing_items.items():
                     embed.add_field(
                         name=f"📁 {library}",
-                        value=f"Found: **{len(items)}** items",
+                        value=f"Missing: **{len(items)}** items",
                         inline=True,
                     )
 
@@ -1234,6 +1270,27 @@ def _is_path_in_library(file_path, library_location):
         return False
 
 
+def _item_level_folder(file_path, walk_root):
+    """Return the show/movie-level folder: the immediate child of walk_root containing file_path.
+
+    Collapses season-level paths to show-level so all missing episodes in the same
+    show produce one scan request instead of one per season.
+
+    Examples:
+      TV:    /library/Show (Year)/Season 01/ep.mkv  ->  /library/Show (Year)
+      Movie: /library/Movie (Year)/movie.mkv        ->  /library/Movie (Year)
+    """
+    norm_root = os.path.normcase(os.path.normpath(walk_root))
+    path = os.path.normpath(os.path.dirname(file_path))
+    while True:
+        parent = os.path.dirname(path)
+        if os.path.normcase(os.path.normpath(parent)) == norm_root:
+            return path
+        if os.path.normpath(path) == os.path.normpath(parent):
+            return os.path.normpath(os.path.dirname(file_path))
+        path = parent
+
+
 def _is_path_parent_of(parent_path, child_path):
     normalized_parent = os.path.normcase(os.path.normpath(parent_path))
     normalized_child = os.path.normcase(os.path.normpath(child_path))
@@ -1927,7 +1984,7 @@ def _scan_walk_root(walk_root):
                         )
                         logger.debug(f"[MISS] Not indexed on any server: {filename}")
 
-                parent_folder = os.path.dirname(file_path)
+                parent_folder = _item_level_folder(file_path, walk_root)
                 for server_status in missing_servers:
                     if server_status["library_info"]:
                         result["missing_events"].append(
@@ -2201,6 +2258,12 @@ def run_scan():
     logger.info(f" Broken symlinks:     {stats.broken_symlinks}")
     logger.info(f" Duration:            {scan_duration:.1f}s")
     logger.info("--------------------")
+
+    stats.rescans_queued = len(pending_scans)
+    stats.rescans_processed = processed_scans
+    stats.batches_sent = batches_sent
+    stats.metadata_queued = len(pending_metadata_refreshes)
+    stats.metadata_processed = processed_metadata_refreshes
 
     # Send the final summary to Discord
     asyncio.run(stats.send_discord_summary())
